@@ -1,0 +1,14 @@
+# Système d'exploitation et éditeurs
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Rendus locaux des diagrammes
+node_modules/
+*.mmd.svg
+*.mmd.png
+
+# Configuration locale de Claude Code
+.claude/settings.local.json
