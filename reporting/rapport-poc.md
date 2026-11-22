@@ -653,27 +653,201 @@ par seconde est donc une exigence de déploiement, reprise dans le plan de remé
 
 ## 5. Enseignements
 
-<!-- À rédiger (#26) -->
-
 ### 5.1 Réserver puis publier, ou publier pour réserver
 
-<!-- À rédiger (#26) -->
+Le scénario du document d'exigences dit qu'« un événement devrait être publié pour
+réserver un lit ». Lu à la lettre, l'événement serait une commande, traitée plus tard
+par un consommateur qui décrémenterait le compteur de l'hôpital. La PoC fait l'inverse :
+elle **réserve d'abord, dans une transaction, puis publie un fait accompli**,
+`BedReserved` ([ADR 0006](../adr/0006-reserver-puis-publier.md)).
+
+| Critère | Publier pour réserver (commande) | Réserver puis publier (retenu) |
+| --- | --- | --- |
+| Réponse au régulateur, au téléphone avec l'appelant | Asynchrone : attendre puis interroger le résultat | Immédiate : hôpital, distance et lits restants dans la réponse |
+| Invariant de capacité (pas de double attribution du dernier lit) | À tenir dans le consommateur : partitionnement par hôpital ou verrouillage en base | Tenu par un décrément conditionnel et le verrou de ligne jusqu'au `COMMIT` |
+| Absence de lit | Événement de refus à renvoyer, puis relance vers l'hôpital suivant | Recherche relancée dans la même transaction |
+| Intégration événementielle | Oui | Oui : chaque réservation produit un événement consommable |
+
+Les tests d'intégration prouvent l'invariant : le dernier lit n'est réservé qu'une fois
+sous des demandes concurrentes, et une demande qui le manque passe à l'hôpital suivant
+([`BedReservationIntegrationTest`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/test/java/com/example/medhead/hospital/application/BedReservationIntegrationTest.java)).
+Sous charge, aucune surréservation n'a été observée ([4.2](#42-performance-de-lapi)).
+
+**Enseignement** : dans un système critique pour le patient, l'événement doit d'abord
+informer, pas décider. La décision qui engage une ressource rare reste dans une
+transaction courte et cohérente ; les événements diffusent le résultat. Si un hôpital
+doit un jour confirmer ou refuser une réservation, le flux pourra s'enrichir
+d'événements `BedReservationConfirmed` ou `BedReservationCancelled` (saga), sans
+remettre en cause la réservation transactionnelle. Cette lecture du scénario est un
+écart d'interprétation assumé, à présenter comme tel.
 
 ### 5.2 L'outbox sous charge
 
-<!-- À rédiger (#26) -->
+**Ce qui a été observé.**
+
+1. La première version du publieur interrogeait l'outbox à intervalle régulier. Elle
+   imposait un compromis entre latence et charge sur la base
+   ([ADR 0003](../adr/0003-outbox-transactionnelle-redis-streams.md)). Les campagnes
+   historiques du 28 octobre 2026, menées avec cette version, laissaient déjà
+   28 821 puis 44 293 événements en attente à la fin des campagnes complètes
+   ([checklist du 4 novembre](https://github.com/TheFatAndFurious/MedHead/blob/ce8dbf4de37e7868b64ddca32df5210ce0705fe8/docs/validation-poc.md#résultats-de-charge-conservés) ;
+   mesures prises sur un arbre modifié, donc indicatives).
+2. Le publieur est passé à `LISTEN/NOTIFY` : il est réveillé au `COMMIT` et n'interroge
+   plus la base quand il n'y a rien à publier. Au régime nominal, chaque événement est
+   désormais publié en quelques millisecondes (retard p50 de 4,3 à 4,6 ms).
+3. Au pic, le retard reste incompatible avec un usage en temps réel. Le publieur traite
+   les événements un par un, dans une transaction chacun, et plafonne à 140 à
+   240 événements par seconde environ, alors que l'API en produit jusqu'à 800. À
+   400 réservations/s, l'envoi `XADD` passe de 1,64 ms au régime nominal à 4,31 ms au
+   pic et 6,56 ms pendant la récupération, et représente l'essentiel de chaque
+   publication. Doubler les CPU de PostgreSQL ne change pas ce débit.
+4. Après la campagne à 400 req/s, le flux Redis contenait 172 802 entrées malgré
+   `MAXLEN ~ 10000` : la rétention `ACKED` ne supprime que les entrées acquittées par
+   tous les groupes, et le groupe n'a aucun consommateur pendant les tests.
+   L'hypothèse la plus probable est que chaque `XADD` tente une réduction impossible
+   et coûte de plus en plus cher. Elle reste à confirmer.
+
+Source : [résultats du 22 novembre 2026, section (b)](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-22.md#b-santé-de-loutbox-référence-postgresql-à-2-cpu).
+
+**Ce qui a bien fonctionné** : l'outbox a joué son rôle de tampon. Le retard de
+publication n'a jamais ralenti les réservations ni la réponse au régulateur, et aucun
+événement n'a été perdu ni dupliqué en base. La publication finit par rattraper son
+retard une fois la charge retombée.
+
+**Pistes d'amélioration**, par ordre d'effet attendu :
+
+- envoyer les `XADD` en pipeline ou par lots, avec une transaction par lot plutôt que par
+  événement, et ne créer le groupe de consommateurs qu'une fois
+  ([#6](https://github.com/TheFatAndFurious/MedHead/issues/6)) ;
+- revoir la rétention du flux et la tester avec un consommateur actif ; protéger Redis
+  d'un flux sans consommateur ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)) ;
+- borner l'attente de l'écoute `LISTEN`
+  ([#7](https://github.com/TheFatAndFurious/MedHead/issues/7)) et isoler un événement
+  impossible à publier ([#8](https://github.com/TheFatAndFurious/MedHead/issues/8)) ;
+- répartir la publication sur plusieurs instances (déjà possible grâce à
+  `SKIP LOCKED`) ;
+- fixer un objectif de service sur le retard de publication (par exemple au p99) et le
+  suivre en continu ;
+- à l'échelle de la plateforme, publier vers un journal partitionné comme Kafka, qui
+  absorbe ces débits.
+
+**Enseignement** : la cohérence transactionnelle de l'outbox est acquise, mais son débit
+doit être dimensionné et mesuré comme celui de l'API. Un événement garanti mais publié
+avec plusieurs minutes de retard ne sert pas un hôpital receveur qui doit préparer
+l'arrivée du patient.
 
 ### 5.3 Compromis assumés, écarts avec la production et plan de remédiation
 
-<!-- À rédiger (#26) -->
+#### Compromis assumés
+
+| Compromis | Raison | Traçabilité |
+| --- | --- | --- |
+| Front SvelteKit au lieu d'Angular, React ou VueJS | Jetons OAuth jamais exposés au navigateur, sans service BFF | [ADR 0002](../adr/0002-front-sveltekit-derogation.md), dérogation du mentor |
+| Réserver puis publier, au lieu de publier pour réserver | Invariant de capacité et réponse immédiate | [ADR 0006](../adr/0006-reserver-puis-publier.md) |
+| Redis Streams au lieu de Kafka | Un seul conteneur, déjà nécessaire pour les sessions | [ADR 0003](../adr/0003-outbox-transactionnelle-redis-streams.md) |
+| HTTP entre le front, l'API et Keycloak sur le réseau Docker ; Keycloak en mode développement | Démonstration locale, ports publiés sur `127.0.0.1` seulement | [#16](https://github.com/TheFatAndFurious/MedHead/issues/16) |
+| Distance à vol d'oiseau | Pas de dépendance à un service d'itinéraire | [ADR 0005](../adr/0005-postgis-recherche-proximite.md) |
+| Huit lieux d'urgence prédéfinis dans le front | Démonstration reproductible ; l'API accepte toute coordonnée | [4.1](#41-résultats-fonctionnels) |
+| Données fictives, comptes de démonstration | Principe C4 : aucune donnée réelle dans une PoC | [3.1](#31-rgpd) |
+| Une instance de chaque service sur un seul poste | Périmètre d'une PoC | [Diagramme de déploiement](../diagrammes/deploiement.md) |
+
+#### Plan de remédiation
+
+Le backlog de durcissement du dépôt de code décrit chaque écart, son risque et la
+correction proposée. Le plan les ordonne en quatre étapes ; les écarts qui n'ont pas
+encore d'issue sont signalés comme tels.
+
+| Étape | Objectif | Travaux |
+| --- | --- | --- |
+| **1. Avant tout déploiement hors poste local** | Sécurité minimale d'un environnement partagé | [#16](https://github.com/TheFatAndFurious/MedHead/issues/16) (HTTPS interne, Keycloak en production, secrets obligatoires) ; [#1](https://github.com/TheFatAndFurious/MedHead/issues/1) (rôle PostgreSQL) ; [#3](https://github.com/TheFatAndFurious/MedHead/issues/3) (comptes Redis) ; [#4](https://github.com/TheFatAndFurious/MedHead/issues/4) (CSP) ; [#5](https://github.com/TheFatAndFurious/MedHead/issues/5) (accès aux métriques) ; [#12](https://github.com/TheFatAndFurious/MedHead/issues/12) (actions CI par SHA) ; [#14](https://github.com/TheFatAndFurious/MedHead/issues/14) (fonds de carte) ; [#15](https://github.com/TheFatAndFurious/MedHead/issues/15) (image PostGIS) ; analyse automatique du code et des dépendances en CI (sans issue) |
+| **2. Fiabilité et débit des événements** | Retard de publication compatible avec le temps réel | [#6](https://github.com/TheFatAndFurious/MedHead/issues/6) (débit) ; [#2](https://github.com/TheFatAndFurious/MedHead/issues/2) (flux sans consommateur) ; [#7](https://github.com/TheFatAndFurious/MedHead/issues/7) (écoute sans délai) ; [#8](https://github.com/TheFatAndFurious/MedHead/issues/8) (événement bloquant) ; [#9](https://github.com/TheFatAndFurious/MedHead/issues/9) (événements orphelins) ; purge de l'outbox et premier consommateur réel (sans issue) |
+| **3. Performance et exploitation** | Tenir 800 req/s par instance dans l'environnement cible, et le prouver | Dimensionner PostgreSQL d'après la campagne à 4 CPU ; expliquer le blocage de sept secondes du scénario mixte ; répéter les campagnes avec un générateur sur une autre machine ; [#13](https://github.com/TheFatAndFurious/MedHead/issues/13) (liste des hôpitaux sans limite) ; plusieurs instances derrière un répartiteur, SLI et alertes, plan de reprise d'activité (sans issue) |
+| **4. Conformité et intégration à la plateforme** | Passer de la PoC à un service de production | AIPD, registre des traitements, chiffrement au repos, durées de conservation appliquées ([3.1](#31-rgpd)) ; spécification OpenAPI ; mesure de la couverture de code ; intégration au fournisseur d'identité OIDC de l'État et à la passerelle d'API ; saisie libre de la localisation et temps de trajet réel (tous sans issue) ; [#10](https://github.com/TheFatAndFurious/MedHead/issues/10) (message du front sur `404`) |
+
+L'issue [#11](https://github.com/TheFatAndFurious/MedHead/issues/11) (casse des chemins)
+est déjà corrigée.
 
 ### 5.4 Objectifs métier et méthode de mesure
 
-<!-- À rédiger (#26) -->
+Le document d'exigences fixe deux objectifs métier : **plus de 90 % des urgences
+acheminées vers l'hôpital compétent le plus proche**, et un **temps moyen de traitement
+d'une urgence ramené de 18,25 à 12 minutes**. **La PoC ne les mesure pas** : elle
+n'est reliée ni à un centre de régulation, ni aux admissions des hôpitaux. Elle en
+prépare la mesure, puisque chaque réservation produit un événement horodaté.
+
+**Part des urgences orientées vers l'hôpital compétent le plus proche**
+
+- *Définition* : une urgence est bien orientée si le patient est admis dans l'hôpital le
+  plus proche qui possédait la spécialité et un lit libre au moment de la demande.
+- *Données* : l'événement `BedReserved` (hôpital proposé, spécialité, date), un
+  événement d'admission publié par l'hôpital receveur, et un instantané des lits
+  disponibles au moment de la demande, que le lac de données de la cible permet de
+  reconstituer.
+- *Calcul* : nombre d'urgences dont l'hôpital d'admission est l'hôpital optimal recalculé
+  a posteriori, divisé par le nombre total d'urgences, par mois et par centre.
+  L'écart entre l'hôpital proposé et l'hôpital d'admission mesure aussi les
+  réorientations manuelles.
+- *Référence* : la même mesure sur le système actuel, avant déploiement.
+
+**Temps moyen de traitement d'une urgence**
+
+- *Définition* : du début de l'appel au centre de régulation jusqu'à la confirmation de
+  l'hôpital de destination. <!-- TODO Matt : faire valider les bornes exactes de la mesure par le métier -->
+- *Données* : l'horodatage de création de l'appel dans le journal du centre de
+  régulation (« Emergency Call Log » de l'architecture de base) et l'`occurredAt` de
+  l'événement `BedReserved`.
+- *Calcul* : moyenne, médiane et 90e centile, par centre et par mois, comparés à la
+  valeur actuelle de 18,25 minutes. Un déploiement progressif, comme le jalon de test
+  A/B prévu dans la feuille de route du consortium, permet de comparer des centres
+  équipés et non équipés sur la même période.
+- *Part de l'API* : au pic de 800 req/s, le p99 de l'API est de 29,5 ms avec une base à
+  4 CPU ([4.2](#42-performance-de-lapi)), négligeable devant un objectif en minutes. Le
+  gain attendu viendra du processus : suppression des appels entre hôpitaux pour
+  trouver un lit, et réservation en un seul geste.
 
 ### 5.5 Retour sur la démarche
 
-<!-- À rédiger (#26) -->
+**Pilotage par issues.** Le travail a été découpé en lots, chacun décrit par une issue
+autonome avec ses critères de fin, et suivi dans l'issue de pilotage
+[#17](https://github.com/TheFatAndFurious/MedHead/issues/17). Les lots sont ordonnés en
+vagues selon leurs dépendances ; ceux d'une même vague ont avancé en parallèle, chacun
+dans son propre worktree et avec un projet Docker Compose isolé, pour ne pas se gêner.
+Les risques repérés en cours de route deviennent des issues du backlog de durcissement
+(#1 à #16), ce qui alimente directement le plan de remédiation.
+
+**Workflow Git.** Le dépôt suit GitHub Flow : une branche courte par issue, une pull
+request vers `master` avec un modèle qui rappelle l'issue liée et les vérifications, des
+commits au format Conventional Commits et une fusion en merge commit, qui garde le lien
+issue ↔ branche ↔ pull request ↔ commits
+([README, Workflow Git](https://github.com/TheFatAndFurious/MedHead/blob/master/README.md#workflow-git)).
+Une règle GitHub protège `master` : suppression et réécriture de l'historique
+interdites, contrôles `frontend-ci`, `backend-ci` et `e2e` requis.
+<!-- TODO Matt : le README annonce une pull request obligatoire, mais la règle GitHub de master (ruleset « master ») ne contient pas de règle « pull request ». L'ajouter, ou corriger le README. -->
+
+**CI/CD.** Chaque pull request exécute toute la pyramide de tests et publie ses rapports.
+Chaque push sur `master` publie des images étiquetées par commit sur GHCR ; un tag `v*`
+déclenche une release. Aucune release n'est encore taguée à la date du rapport : le tag
+`v1.0.0` est prévu par la vérification finale
+([#27](https://github.com/TheFatAndFurious/MedHead/issues/27)).
+
+**Ce que la démarche a apporté.**
+
+- Les tests E2E ont trouvé un vrai défaut que les tests de l'API, qui forgent leurs
+  propres jetons, ne pouvaient pas voir : sans le scope `basic` du client Keycloak, le
+  jeton d'accès ne portait pas l'identifiant `sub` et toutes les réservations
+  échouaient ([correctif `28ad192`](https://github.com/TheFatAndFurious/MedHead/commit/28ad192)).
+- Les campagnes de charge d'octobre avaient été lancées sur un arbre de travail modifié,
+  ce qui empêche d'identifier exactement le code mesuré. Les campagnes du 22 novembre
+  enregistrent le commit et vérifient que l'arbre est propre : une mesure n'a de valeur
+  que si elle est rattachée à une version.
+- La checklist de validation du 4 novembre était devenue partiellement périmée en trois
+  semaines (authentification et CI du front ajoutées depuis). Les preuves doivent pointer
+  vers des artefacts versionnés et produits automatiquement plutôt que vers des
+  constats manuels datés.
+- La campagne complémentaire à 4 CPU a transformé un échec brut en diagnostic : la
+  limite venait de la base, pas de l'instance de service mesurée.
+
+<!-- TODO Matt : ajouter ton retour personnel sur la démarche (organisation, difficultés, temps passé, ce que tu referais autrement). -->
 
 ## 6. Annexes
 
