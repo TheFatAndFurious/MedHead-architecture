@@ -439,15 +439,217 @@ Le principe C4 (IV) demande que la PoC vise spécifiquement B1, B2, B3 et B4.
 
 ## 4. Résultats de la PoC
 
-<!-- À rédiger (#26) -->
-
 ### 4.1 Résultats fonctionnels
 
-<!-- À rédiger (#26) -->
+**La PoC est un succès d'un point de vue fonctionnel.** Le scénario du document
+d'exigences est exécuté tel quel et réussit : pour une urgence en cardiologie près de
+l'hôpital Fred Brooks, l'API propose l'hôpital Fred Brooks, y réserve un lit et publie
+l'événement `BedReserved`. Le parcours complet fonctionne dans un navigateur, de la
+connexion du régulateur à l'affichage de l'hôpital retenu. Toutes les suites de tests
+réussissent sur le commit de référence, sans test ignoré.
+
+#### Scénario du document d'exigences (Cucumber)
+
+Le fichier
+[`intervention-urgence.feature`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/test/resources/features/intervention-urgence.feature)
+reprend le scénario du PDF mot pour mot, en français, avec sa table des trois hôpitaux.
+Il ajoute deux scénarios qui vérifient les deux autres critères de sélection :
+
+| Scénario | Résultat attendu | Résultat au commit de référence |
+| --- | --- | --- |
+| Scénario du document d'exigences : cardiologie près de Fred Brooks | Fred Brooks proposé, un lit réservé, `BedReserved` écrit dans l'outbox | Réussi |
+| Urgence tout près de Julia Crusher, compétente mais sans lit | Fred Brooks proposé : le filtre sur les lits disponibles s'applique | Réussi |
+| Spécialité qu'aucun de ces hôpitaux ne propose | Demande refusée (`404`), aucun lit consommé, aucun événement | Réussi |
+
+Les scénarios appellent l'API REST réelle avec un jeton `REGULATEUR`, sur une base
+PostGIS en TLS. Le rapport HTML est publié par la CI (artefact
+`cucumber-acceptance-report-<sha>` du
+[run de référence](https://github.com/TheFatAndFurious/MedHead/actions/runs/45066204052)).
+L'événement vérifié est la ligne écrite dans l'outbox, dans la même transaction que la
+réservation ; sa publication dans Redis Streams est vérifiée par les tests
+d'intégration de l'outbox.
+
+#### Parcours E2E (Playwright)
+
+Les tests de [`frontend/e2e`](https://github.com/TheFatAndFurious/MedHead/tree/master/frontend/e2e)
+pilotent Chromium sur la pile complète (front, API, Keycloak, PostGIS, Redis), démarrée
+par Docker Compose dans le job `e2e` de la CI :
+
+| Parcours | Résultat attendu | Résultat au commit de référence |
+| --- | --- | --- |
+| Régulateur, Westminster, cardiologie | L'hôpital retenu, la distance et la référence de réservation s'affichent | Réussi |
+| Régulateur, Westminster, allergie | Message d'absence de lit, sans réservation | Réussi |
+| Lecteur | Formulaire désactivé ; la réservation envoyée directement au serveur est refusée (`403`) | Réussi |
+| Visiteur non connecté | Seul « Se connecter » est proposé, et mène à Keycloak | Réussi |
+| Déconnexion | Les sessions MedHead et Keycloak sont fermées | Réussi |
+
+Source : journal du job `e2e` du run de référence (« 5 passed ») et artefact
+`playwright-report-<sha>`.
+
+#### Tests par niveau
+
+Exécution de référence : [run 45066204052](https://github.com/TheFatAndFurious/MedHead/actions/runs/45066204052)
+du 22 novembre 2026, commit `ce8dbf4`. Les nombres du back-end viennent des rapports
+JUnit de l'artefact `backend-test-reports-<sha>` ; ceux du front, des journaux des
+jobs `frontend-ci` et `e2e`.
+
+| Niveau | Outil | Tests | Résultat | Ce qui est couvert |
+| --- | --- | ---: | --- | --- |
+| Unitaires et composants (API) | JUnit 5, MockMvc, ArchUnit | 28 | 28 réussis | Règles du domaine `Hospital` (5) ; contrôleur de réservation : codes `201`, `400`, `404`, `422` et rejeu (8) ; sécurité : rôles, jetons expirés, falsifiés, d'un autre émetteur ou d'une autre audience (10) ; métriques du publieur (3) ; règle d'architecture (1) ; `/actuator/info` (1) |
+| Intégration (API + PostgreSQL / Redis en TLS) | JUnit 5, Spring Boot Test | 35 | 35 réussis | Réservation : hôpital le plus proche, idempotence, rollback si l'outbox échoue, dernier lit réservé une seule fois sous concurrence, report sur l'hôpital suivant (13) ; outbox : publication TLS, reprise, doublon après échec du commit, publieurs concurrents, rétention (15) ; catalogues (4) ; TLS `verify-full` (3) |
+| Acceptation (BDD) | Cucumber | 3 | 3 réussis | Scénario du document d'exigences et deux variantes, ci-dessus |
+| Unitaires (front) | `node:test` | 22 | 22 réussis | Sessions serveur, rafraîchissement et déconnexion, cookies, contrôle d'origine, actions de réservation (jetons jamais exposés, clé d'idempotence, refus non relancés, réponse perdue renvoyable) |
+| Vérification statique (front) | `svelte-check` | — | 0 erreur, 0 avertissement | Types TypeScript et composants Svelte |
+| E2E | Playwright (Chromium) | 5 | 5 réussis | Parcours ci-dessus |
+| Charge et stress | k6 | 7 exécutions | Voir [4.2](#42-performance-de-lapi) | Latence, débit, outbox et cohérence sous charge |
+
+Total des tests automatisés exécutés par la CI : **93** (66 pour l'API, 22 unitaires
+et 5 E2E pour le front), **tous réussis**. L'outillage de charge a aussi ses propres
+tests unitaires (`tests/performance/test_*.py`), hors CI : 18 réussis lors d'une
+exécution locale le 22 novembre 2026 sur le commit de référence.
+
+La CI échoue si une suite d'intégration ou d'acceptation attendue manque, n'exécute
+aucun test ou contient un test ignoré
+([README, Intégration continue](https://github.com/TheFatAndFurious/MedHead/blob/master/README.md#intégration-continue)).
+**La couverture de code n'est pas mesurée** : aucun outil comme JaCoCo n'est
+configuré. La colonne « Ce qui est couvert » décrit donc une couverture fonctionnelle,
+pas un pourcentage de lignes.
+
+#### Écarts fonctionnels connus
+
+- La localisation se choisit parmi huit lieux de démonstration, pas par saisie libre
+  ([README du front](https://github.com/TheFatAndFurious/MedHead/blob/master/frontend/README.md#carte-des-hôpitaux-et-lieux-durgence)).
+  L'API, elle, accepte n'importe quelles coordonnées valides.
+- Le scénario demande de « publier un événement pour réserver un lit » ; la PoC réserve
+  puis publie (voir [5.1](#51-réserver-puis-publier-ou-publier-pour-réserver)).
+- Le front affiche « aucun lit disponible » pour toute réponse `404`
+  ([#10](https://github.com/TheFatAndFurious/MedHead/issues/10)).
 
 ### 4.2 Performance de l'API
 
-<!-- À rédiger (#26) -->
+Le document d'exigences (p. 1) fixe le critère suivant : **un temps de réponse de moins
+de 200 ms avec une charge allant jusqu'à 800 requêtes par seconde, par instance de
+service**. La [stratégie de tests de charge](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/strategie-tests-charge.md)
+l'interprète ainsi : p95 **et** p99 strictement inférieurs à 200 ms à chaque phase,
+sans erreur ni itération abandonnée, pour une instance d'API limitée à 2 CPU et 1 Gio,
+avec un pic tenu cinq minutes.
+
+Toutes les valeurs de cette section viennent du
+[rapport du 22 novembre 2026](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-22.md)
+et des `verdict.json` de chaque exécution, dans
+[`resultats-2026-11-22/`](https://github.com/TheFatAndFurious/MedHead/tree/master/docs/performance/resultats-2026-11-22).
+
+#### Conditions de mesure
+
+| Élément | Valeur |
+| --- | --- |
+| Point d'accès mesuré | `POST /api/v1/hospitals/reservations`, avec un JWT et une clé `Idempotency-Key` neuve par requête |
+| Profil | Échauffement de 2 min (exclu), nominal à 80 req/s pendant 5 min, pic à 800 req/s pendant 5 min, récupération à 80 req/s pendant 5 min |
+| Scénarios | « Réservations réussies » (toutes les demandes trouvent un lit) et « mixte » (50 % de réservations, 50 % de refus `404`) |
+| Données | 2 000 hôpitaux, dont 1 600 avec des lits |
+| Instance d'API | 2 CPU, 1 Gio (tas JVM jusqu'à 75 %), pool de 10 connexions |
+| Configuration de référence | PostgreSQL à 2 CPU et 2 Gio, Redis à 1 CPU, commit [`298a151`](https://github.com/TheFatAndFurious/MedHead/commit/298a151ef81d140e9d6881515b2573493cccdc7e) |
+| Campagne complémentaire | Même chose avec PostgreSQL à **4 CPU** (`PERF_DATABASE_CPUS=4`), commit [`9ce17f2`](https://github.com/TheFatAndFurious/MedHead/commit/9ce17f288b55c911b8c214ccea3f70e0ffba6554) |
+| Code de l'API | Identique à `master` `576edf0` pour les deux commits, arbre propre |
+| Hôte | Apple M4, 10 cœurs, 16 Gio ; Docker Desktop 28.1.1 ; k6 v1.2.1 sur l'hôte ; délai client de 2 s |
+
+#### Configuration de référence (PostgreSQL à 2 CPU)
+
+| Scénario | Phase | Débit réel | Requêtes | p50 | p95 | p99 | max | Erreurs |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Réussies, pic 800 | Nominal | 80,0 req/s | 24 001 | 3,4 ms | 5,1 ms | 8,4 ms | 58,2 ms | 0,00 % |
+| Réussies, pic 800 | **Pic** | 728,4 req/s | 218 524 | 1 998,8 ms | 2 000,2 ms | 2 003,7 ms | 6 500,0 ms | **95,12 %** |
+| Réussies, pic 800 | Récupération | 79,6 req/s | 23 878 | 3,4 ms | 1 991,6 ms | 2 000,0 ms | 2 015,3 ms | 5,12 % |
+| Mixte, pic 800 | Nominal | 80,0 req/s | 24 002 | 4,0 ms | 7,3 ms | 9,8 ms | 114,7 ms | 0,00 % |
+| Mixte, pic 800 | **Pic** | 797,4 req/s | 239 233 | 2,5 ms | 8,1 ms | **1 004,8 ms** | 2 001,9 ms | 0,21 % |
+| Mixte, pic 800 | Récupération | 79,9 req/s | 23 963 | 3,0 ms | 4,9 ms | 9,5 ms | 1 630,0 ms | 0,00 % |
+| Réussies, pic 400 (exploratoire) | Nominal | 80,0 req/s | 24 001 | 3,5 ms | 5,2 ms | 8,2 ms | 100,7 ms | 0,00 % |
+| Réussies, pic 400 (exploratoire) | **Pic** | 400,0 req/s | 120 001 | 2,9 ms | 6,0 ms | 15,1 ms | 166,0 ms | 0,00 % |
+| Réussies, pic 400 (exploratoire) | Récupération | 80,0 req/s | 24 001 | 3,1 ms | 5,6 ms | 22,9 ms | 311,7 ms | 0,00 % |
+
+- **Réservations réussies à 800 req/s : échec.** PostgreSQL sature à sa limite de
+  2 CPU ; le serveur ne valide qu'environ 412 réservations par seconde, la file
+  d'attente s'allonge et les requêtes dépassent le délai client de 2 s. k6 abandonne
+  21 600 itérations. Les erreurs de la récupération surviennent toutes dans les
+  20 premières secondes après le pic.
+- **Mixte à 800 req/s : échec sur le p99.** Le débit est presque tenu et le p95 reste à
+  8,1 ms, mais un blocage d'environ sept secondes en fin de pic, de cause non
+  identifiée, concentre les 500 requêtes en échec et porte le p99 à 1 s.
+- **Réservations réussies à 400 req/s : réussi**, sans erreur.
+
+#### Campagne complémentaire (PostgreSQL à 4 CPU)
+
+| Scénario | Phase | Débit réel | Requêtes | p50 | p95 | p99 | max | Erreurs |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Réussies, pic 800 | Nominal | 80,0 req/s | 24 001 | 3,4 ms | 4,7 ms | 6,6 ms | 46,6 ms | 0,00 % |
+| Réussies, pic 800 | **Pic** | **800,0 req/s** | 240 001 | 3,1 ms | 10,0 ms | **29,5 ms** | 420,7 ms | **0,00 %** |
+| Réussies, pic 800 | Récupération | 80,0 req/s | 24 000 | 3,0 ms | 4,6 ms | 7,4 ms | 130,8 ms | 0,00 % |
+| Mixte, pic 800 | Nominal | 80,0 req/s | 24 002 | 3,7 ms | 6,8 ms | 8,4 ms | 49,6 ms | 0,00 % |
+| Mixte, pic 800 | **Pic** | **800,0 req/s** | 240 001 | 2,4 ms | 4,3 ms | **8,6 ms** | 222,3 ms | **0,00 %** |
+| Mixte, pic 800 | Récupération | 80,0 req/s | 24 002 | 2,9 ms | 4,7 ms | 7,7 ms | 101,2 ms | 0,00 % |
+
+Aucune itération abandonnée dans les deux scénarios, toutes les vérifications métier
+conformes. Le blocage de fin de pic du scénario mixte ne se reproduit pas. Quelques
+requêtes isolées dépassent 200 ms (maximum de 420,7 ms et de 222,3 ms au pic), sans
+effet sur le p99.
+
+#### Ressources au pic
+
+Moyenne et maximum des relevés `docker stats` toutes les 5 s ; 100 % correspond à un
+cœur.
+
+| Configuration | Scénario | API (limite 200 %) | PostgreSQL | Redis (limite 100 %) | k6 (hôte) |
+| --- | --- | --- | --- | --- | --- |
+| Référence | Réussies 800 | 79 % (max 126 %), 959 Mio | **170 %** (max 220 %) sur 200 % | 4 % (max 62 %) | 63 % (max 179 %) |
+| Référence | Mixte 800 | 51 % (max 127 %), 519 Mio | 104 % (max 216 %) sur 200 % | 72 % (max 86 %) | 32 % (max 55 %) |
+| Référence | Réussies 400 | 30 % (max 45 %), 463 Mio | 83 % (max 130 %) sur 200 % | 79 % (max 85 %) | 20 % (max 35 %) |
+| PostgreSQL 4 CPU | Réussies 800 | 63 % (max 112 %), 553 Mio | 182 % (max 308 %) sur 400 % | 74 % (max 81 %) | 26 % (max 49 %) |
+| PostgreSQL 4 CPU | Mixte 800 | 45 % (max 66 %), 478 Mio | 98 % (max 115 %) sur 400 % | 77 % (max 86 %) | 25 % (max 46 %) |
+
+Avec 4 CPU, PostgreSQL dépasse régulièrement les 2 CPU de la configuration de
+référence (pointes à 308 %), tandis que l'API garde une marge (63 % sur 200 % en
+moyenne). **La limite constatée en référence vient de la base, pas de l'instance
+d'API.**
+
+#### Verdict face à l'exigence
+
+| Configuration | « < 200 ms jusqu'à 800 req/s par instance » |
+| --- | --- |
+| **Référence, PostgreSQL à 2 CPU** | **Non satisfaite.** Tenue à 80 req/s (p99 inférieur à 10 ms) et à 400 réservations/s (p99 de 15,1 ms), pas à 800 req/s : la base sature. |
+| **PostgreSQL à 4 CPU** | **Satisfaite pour l'instance d'API** (2 CPU, 1 Gio) : 800 req/s pendant 5 minutes, p99 du pic de **29,5 ms** en réservations réussies et de **8,6 ms** en mixte, sans erreur. |
+
+Autrement dit, l'instance de service tient l'exigence, à condition que sa base soit
+dimensionnée en conséquence. Le dimensionnement de PostgreSQL pour 800 réservations
+par seconde est donc une exigence de déploiement, reprise dans le plan de remédiation.
+
+#### Cohérence et outbox
+
+- **Cohérence : conforme dans toutes les campagnes**, même sous saturation : aucun lit
+  négatif, aucune surréservation, une demande enregistrée et un événement `BedReserved`
+  par réservation. Par exemple, 292 802 réservations en base pour 292 802 réponses
+  `201` dans la campagne à 4 CPU.
+- **Outbox : échec dans toutes les campagnes, y compris à 4 CPU.** Au régime nominal,
+  chaque événement est publié en quelques millisecondes. Au pic, le publieur ne traite
+  que 140 à 240 événements par seconde environ, et son retard atteint plusieurs minutes
+  sans se résorber pendant la récupération. En fin de récupération, 91 727, 22 188 et
+  39 192 événements restent en attente dans les trois campagnes de référence, 159 830 et
+  16 884 dans les deux campagnes à 4 CPU. Ce point est analysé en
+  [5.2](#52-loutbox-sous-charge).
+
+#### Limites de la mesure
+
+- **Une seule exécution par scénario** : la reproductibilité n'est pas établie.
+- **Générateur sur la même machine** : k6 tourne sur l'hôte, a consommé jusqu'à
+  1,8 cœur au pic et partage le processeur avec la VM Docker ; le trafic passe par la
+  redirection de ports de Docker Desktop, absente d'un déploiement réel.
+- **Ressources partagées** : les limites des conteneurs sont des plafonds, pas des
+  réservations exclusives.
+- **Délai client de 2 s** : au-delà, la latence réelle n'est pas mesurée ; les
+  percentiles de la campagne saturée plafonnent vers 2 000 ms.
+- **Pas de consommateur Redis** : le comportement du flux n'est pas celui d'un système
+  avec un consommateur actif.
+- La latence mesurée est celle de l'API vue par k6. Elle n'inclut ni le front, ni le
+  réseau d'un vrai poste de régulation.
 
 ## 5. Enseignements
 
