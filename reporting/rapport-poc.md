@@ -154,7 +154,7 @@ serveur d'application (plus lourd à conteneuriser et à tester pour un service 
 Le document d'exigences (p. 2) impose l'un des frameworks JavaScript / TypeScript
 courants du marché : **Angular, React ou VueJS**. Le front de la PoC est écrit avec
 **SvelteKit** (Svelte 5, TypeScript, adaptateur Node), **par dérogation validée par le
-mentor** le <!-- TODO Matt : date de validation de la dérogation SvelteKit par le mentor -->.
+mentor**. <!-- TODO Matt : ajouter la date de validation de la dérogation SvelteKit par le mentor (aussi dans l'ADR 0002). -->
 La dérogation et ses alternatives sont tracées dans
 l'[ADR 0002](../adr/0002-front-sveltekit-derogation.md).
 
@@ -851,4 +851,61 @@ déclenche une release. Aucune release n'est encore taguée à la date du rappor
 
 ## 6. Annexes
 
-<!-- À rédiger (#26) -->
+### 6.1 Dépôt de code
+
+| Ressource | Lien |
+| --- | --- |
+| Dépôt | [TheFatAndFurious/MedHead](https://github.com/TheFatAndFurious/MedHead) |
+| README : démarrage, tests, CI, workflow Git | [README.md](https://github.com/TheFatAndFurious/MedHead/blob/master/README.md) |
+| Guide du front | [frontend/README.md](https://github.com/TheFatAndFurious/MedHead/blob/master/frontend/README.md) |
+| Authentification et autorisations | [docs/authentification.md](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/authentification.md) |
+| Scénarios d'acceptation | [intervention-urgence.feature](https://github.com/TheFatAndFurious/MedHead/blob/master/src/test/resources/features/intervention-urgence.feature) |
+| Tests E2E | [frontend/e2e/](https://github.com/TheFatAndFurious/MedHead/tree/master/frontend/e2e) |
+| Migrations du schéma | [src/main/resources/db/migration/](https://github.com/TheFatAndFurious/MedHead/tree/master/src/main/resources/db/migration) |
+
+### 6.2 Intégration continue, releases et images
+
+| Ressource | Lien |
+| --- | --- |
+| Workflow | [.github/workflows/ci.yml](https://github.com/TheFatAndFurious/MedHead/blob/master/.github/workflows/ci.yml) |
+| Historique des exécutions | [GitHub Actions](https://github.com/TheFatAndFurious/MedHead/actions/workflows/ci.yml) |
+| Exécution de référence (commit `ce8dbf4`) et ses artefacts | [Run 45066204052](https://github.com/TheFatAndFurious/MedHead/actions/runs/45066204052) : `backend-test-reports-<sha>`, `cucumber-acceptance-report-<sha>`, `playwright-report-<sha>`, `backend-jar-<sha>` |
+| Releases | [Releases du dépôt de code](https://github.com/TheFatAndFurious/MedHead/releases) (aucune à la date du rapport ; `v1.0.0` prévue par [#27](https://github.com/TheFatAndFurious/MedHead/issues/27)) |
+| Images Docker | [Paquets GHCR](https://github.com/TheFatAndFurious?tab=packages&repo_name=MedHead) : `ghcr.io/thefatandfurious/medhead-api` et `ghcr.io/thefatandfurious/medhead-frontend` |
+
+Les artefacts d'une exécution GitHub Actions sont conservés sept jours. Pour une
+soutenance plus tardive, relancer le workflow sur `master` régénère les rapports de
+tests.
+
+### 6.3 Résultats de charge
+
+| Ressource | Lien |
+| --- | --- |
+| Rapport du 22 novembre 2026 | [docs/performance/resultats-2026-11-22.md](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-22.md) |
+| `summary.json` et `verdict.json` de chaque exécution | [docs/performance/resultats-2026-11-22/](https://github.com/TheFatAndFurious/MedHead/tree/master/docs/performance/resultats-2026-11-22) |
+| Stratégie de tests de charge | [docs/performance/strategie-tests-charge.md](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/strategie-tests-charge.md) |
+| Guide d'exécution et scénarios k6 | [tests/performance/](https://github.com/TheFatAndFurious/MedHead/tree/master/tests/performance) |
+
+### 6.4 Architecture
+
+| Ressource | Lien |
+| --- | --- |
+| ADR 0001 : API en Java 21 avec Spring Boot 4.1 | [adr/0001-backend-java-spring-boot.md](../adr/0001-backend-java-spring-boot.md) |
+| ADR 0002 : front SvelteKit, par dérogation | [adr/0002-front-sveltekit-derogation.md](../adr/0002-front-sveltekit-derogation.md) |
+| ADR 0003 : outbox transactionnelle et Redis Streams | [adr/0003-outbox-transactionnelle-redis-streams.md](../adr/0003-outbox-transactionnelle-redis-streams.md) |
+| ADR 0004 : Keycloak OIDC et sessions côté serveur | [adr/0004-authentification-keycloak-sessions-serveur.md](../adr/0004-authentification-keycloak-sessions-serveur.md) |
+| ADR 0005 : PostGIS pour la recherche de proximité | [adr/0005-postgis-recherche-proximite.md](../adr/0005-postgis-recherche-proximite.md) |
+| ADR 0006 : réserver puis publier | [adr/0006-reserver-puis-publier.md](../adr/0006-reserver-puis-publier.md) |
+| Diagramme de contexte (C4 niveau 1) | [diagrammes/contexte.md](../diagrammes/contexte.md) |
+| Diagramme de conteneurs (C4 niveau 2) | [diagrammes/conteneurs.md](../diagrammes/conteneurs.md) |
+| Séquence de réservation | [diagrammes/sequence-reservation.md](../diagrammes/sequence-reservation.md) |
+| Déploiement | [diagrammes/deploiement.md](../diagrammes/deploiement.md) |
+
+### 6.5 Pilotage
+
+| Ressource | Lien |
+| --- | --- |
+| Issue de pilotage | [#17](https://github.com/TheFatAndFurious/MedHead/issues/17) |
+| Backlog de durcissement | Issues [#1](https://github.com/TheFatAndFurious/MedHead/issues/1) à [#16](https://github.com/TheFatAndFurious/MedHead/issues/16) |
+| Pull requests fusionnées | [Dépôt de code](https://github.com/TheFatAndFurious/MedHead/pulls?q=is%3Apr+is%3Amerged), [dépôt d'architecture](https://github.com/TheFatAndFurious/MedHead-architecture/pulls?q=is%3Apr+is%3Amerged) |
+| Checklist de validation du 4 novembre 2026 (historique, remplacée par ce rapport) | [docs/validation-poc.md au commit `ce8dbf4`](https://github.com/TheFatAndFurious/MedHead/blob/ce8dbf4de37e7868b64ddca32df5210ce0705fe8/docs/validation-poc.md) |
