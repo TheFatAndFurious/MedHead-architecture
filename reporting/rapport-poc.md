@@ -111,19 +111,100 @@ Les contextes et conteneurs sont décrits dans les diagrammes de
 
 ## 2. Justification des technologies
 
-<!-- À rédiger (#26) -->
+Deux technologies sont encadrées par le consortium : le langage de l'API (Java) et le
+framework du front (Angular, React ou VueJS). Les autres choix sont libres ; chacun a
+été retenu pour un besoin précis de la PoC, face à une alternative écartée. Les
+décisions structurantes sont détaillées dans les ADR du dépôt d'architecture.
 
 ### 2.1 API : Java imposé, Spring Boot 4.1 et Java 21
 
-<!-- À rédiger (#26) -->
+**La technologie Java a été imposée par le consortium.** Le document d'exigences
+(p. 2) le dit explicitement pour l'API RESTful, et le principe C3 des Principes de
+l'architecture demande de favoriser les langages exécutables sur JVM. L'API est donc
+écrite en Java ; le choix ne portait que sur la version de Java et sur le cadre
+applicatif ([ADR 0001](../adr/0001-backend-java-spring-boot.md)).
+
+**Java 21** est la version LTS retenue
+([`pom.xml`](https://github.com/TheFatAndFurious/MedHead/blob/master/pom.xml)) :
+
+- support à long terme, avec une fin de support plus lointaine que Java 17 ;
+- `record` pour les commandes, réponses et événements immuables (`ReserveBedCommand`,
+  `HospitalReservationResponse`, `BedReservedEvent`) ;
+- API de fils modernes, utilisées pour le fil d'écoute de l'outbox.
+
+**Spring Boot 4.1** (4.1.1 au commit de référence) couvre chaque besoin de l'API par
+une brique standard, sans code d'infrastructure à écrire :
+
+| Besoin | Brique Spring Boot |
+| --- | --- |
+| API REST versionnée et validation des entrées | Spring Web MVC, Bean Validation |
+| Persistance et données géographiques | Spring Data JPA, Hibernate Spatial, JDBC Client |
+| Migrations de schéma | Flyway |
+| Sécurité OAuth 2.0 / OpenID Connect | Spring Security, serveur de ressources JWT |
+| Publication d'événements | Spring Data Redis (Redis Streams) |
+| Santé et métriques | Actuator, Micrometer |
+| Tests | Spring Boot Test, MockMvc |
+
+Alternatives écartées : Quarkus et Micronaut (démarrage plus rapide, mais écosystème
+plus réduit, et la PoC n'a pas de contrainte de démarrage à froid), Jakarta EE sur un
+serveur d'application (plus lourd à conteneuriser et à tester pour un service unique).
 
 ### 2.2 Front : SvelteKit par dérogation, critère de choix
 
-<!-- À rédiger (#26) -->
+Le document d'exigences (p. 2) impose l'un des frameworks JavaScript / TypeScript
+courants du marché : **Angular, React ou VueJS**. Le front de la PoC est écrit avec
+**SvelteKit** (Svelte 5, TypeScript, adaptateur Node), **par dérogation validée par le
+mentor** le <!-- TODO Matt : date de validation de la dérogation SvelteKit par le mentor -->.
+La dérogation et ses alternatives sont tracées dans
+l'[ADR 0002](../adr/0002-front-sveltekit-derogation.md).
+
+**Critère de choix : la sécurité des jetons d'authentification.** L'API est un serveur
+de ressources OAuth 2.0 qui attend un jeton d'accès JWT. Si le navigateur détient ce
+jeton, une faille XSS suffit à le voler. SvelteKit fournit **nativement des routes et
+des actions exécutées côté serveur** (`hooks.server.ts`, `+page.server.ts`) : le front
+mène lui-même la connexion OpenID Connect en client confidentiel et appelle l'API
+depuis son serveur. **Les jetons OAuth ne sont jamais exposés au navigateur**, qui ne
+reçoit qu'un cookie de session opaque, sans service « Backend for Frontend » séparé à
+écrire et à déployer
+([`hooks.server.ts`](https://github.com/TheFatAndFurious/MedHead/blob/master/frontend/src/hooks.server.ts),
+[`+page.server.ts`](https://github.com/TheFatAndFurious/MedHead/blob/master/frontend/src/routes/%2Bpage.server.ts)).
+
+Deux critères secondaires ont pesé :
+
+- **la légèreté** : Svelte compile les composants en JavaScript, sans moteur de DOM
+  virtuel livré au navigateur ; le front n'a que trois dépendances d'exécution
+  (`openid-client`, `redis`, `maplibre-gl`,
+  [`package.json`](https://github.com/TheFatAndFurious/MedHead/blob/master/frontend/package.json)) ;
+- **la simplicité** : un seul projet porte les pages, les formulaires et la partie
+  serveur, et les formulaires HTML fonctionnent sans JavaScript côté client.
+
+Comparaison avec les frameworks de la liste imposée :
+
+| Framework | Jetons hors du navigateur | Conclusion |
+| --- | --- | --- |
+| Angular | Application monopage : il faut un BFF séparé | Écarté : un service de plus |
+| React | Idem ; Next.js offrirait des routes serveur, avec un cadre plus lourd | Écarté pour une page unique |
+| VueJS | Avec Nuxt, routes serveur comparables à SvelteKit | **Alternative de repli** si la dérogation était retirée |
+
+Le choix du front n'engage pas le reste du système : le contrat entre le front et
+l'API est une **API REST versionnée (`/api/v1`), indépendante du framework**.
+Remplacer le front par une application Vue (Nuxt) ou Angular ne demanderait aucune
+modification de l'API.
 
 ### 2.3 Autres technologies
 
-<!-- À rédiger (#26) -->
+| Technologie | Rôle dans la PoC | Pourquoi | Alternative écartée |
+| --- | --- | --- | --- |
+| **PostgreSQL 17 + PostGIS** | Base de réservation, recherche de l'hôpital le plus proche | Le type `geography` calcule les distances en mètres, et un index GiST résout le tri par distance (`<->`). La recherche et le décrément du lit restent dans la même transaction ([ADR 0005](../adr/0005-postgis-recherche-proximite.md)). | Calcul de distance en Java sur toute la table ; Elasticsearch ou Redis GEO, qui ajouteraient une seconde source de vérité à synchroniser avec le compteur de lits |
+| **Redis 8.2 Streams** | Bus d'événements de la PoC (`BedReserved`) et stockage des sessions du front | Journal persistant, groupes de consommateurs et acquittements dans un seul conteneur, déjà nécessaire pour les sessions ([ADR 0003](../adr/0003-outbox-transactionnelle-redis-streams.md)) | Kafka (adapté à la production, mais un cluster à exploiter) ; Redis Pub/Sub (aucun stockage) ; RabbitMQ (pas de relecture par défaut) |
+| **Keycloak 26** | Fournisseur d'identité OpenID Connect, rôles `LECTEUR` et `REGULATEUR` | Standard OIDC, open source, hébergeable sur place : l'API ne dépend que de jetons standard ([ADR 0004](../adr/0004-authentification-keycloak-sessions-serveur.md)) | Authentification maison dans l'API ; fournisseur SaaS (données d'identité hors de l'infrastructure) |
+| **Flyway** | Migrations versionnées du schéma (`V1` à `V6`) et chargement du référentiel des spécialités | Schéma reproductible, appliqué au démarrage de l'API, intégré à Spring Boot ([migrations](https://github.com/TheFatAndFurious/MedHead/tree/master/src/main/resources/db/migration)) | Génération du schéma par Hibernate (non maîtrisée en production) ; Liquibase (équivalent, plus verbeux pour du SQL simple) |
+| **k6** | Tests de charge et de stress de l'API | Scénarios versionnés en JavaScript, débit d'arrivée imposé et seuils automatisables ([stratégie](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/strategie-tests-charge.md)) | JMeter (scénarios XML peu lisibles en revue) ; Gatling (scénarios en Scala ou Java, plus lourds à maintenir pour un seul point d'accès) |
+| **ArchUnit** | Test d'architecture : sens des dépendances `api` → `application` → `persistence` → `domain` | La règle fait échouer le build si une couche dépend d'une couche supérieure ([`ArchitectureTest`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/test/java/com/example/medhead/ArchitectureTest.java)) | Découpage en modules Maven (plus lourd pour un seul service) ; revue manuelle seule |
+| **Cucumber** | Test d'acceptation du scénario du document d'exigences, en français | Le scénario du PDF est exécuté tel quel, en langage métier, comme le demandent les principes B4 et C3 (BDD) ([`intervention-urgence.feature`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/test/resources/features/intervention-urgence.feature)) | Test JUnit nommé d'après le scénario : moins lisible par un interlocuteur métier |
+| **Playwright** | Tests E2E dans Chromium sur la pile complète | Pilote un vrai navigateur à travers la connexion Keycloak, avec traces et rapport HTML en CI ([`frontend/e2e`](https://github.com/TheFatAndFurious/MedHead/tree/master/frontend/e2e)) | Cypress (gestion plus contrainte des redirections entre origines, nécessaires pour Keycloak) ; Selenium (plus verbeux, sans attente automatique) |
+| **Docker et Docker Compose** | Images de l'API et du front ; pile complète en une commande | Environnement reproductible, utilisateurs non privilégiés, limites de ressources pour les tests de charge ([`docker-compose.yaml`](https://github.com/TheFatAndFurious/MedHead/blob/master/docker-compose.yaml)) | Installation manuelle des services ; Kubernetes, disproportionné pour une PoC sur un poste |
+| **GitHub Actions** | CI/CD : tests, rapports, images GHCR, releases | Intégré au dépôt, déclenché par les pull requests, les push sur `master` et les tags ([`ci.yml`](https://github.com/TheFatAndFurious/MedHead/blob/master/.github/workflows/ci.yml)) | Jenkins (serveur à héberger) ; GitLab CI (dépôt hébergé sur GitHub) |
 
 ## 3. Respect des normes et des principes
 
