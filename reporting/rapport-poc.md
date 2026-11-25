@@ -751,8 +751,9 @@ point de passage un par un sur tout disque lent.
   25 novembre 2026, le groupe de consommateurs n'est plus créé qu'une fois, et non à
   chaque événement ([ADR 0003, Évolutions](../adr/0003-outbox-transactionnelle-redis-streams.md#évolutions)).
   La publication par lots, une transaction et un pipeline `XADD` par lot, est en cours
-  ([#40](https://github.com/TheFatAndFurious/MedHead/issues/40)) ; son effet sur les
-  écritures disque et la latence de l'API reste à mesurer* ;
+  ([#40](https://github.com/TheFatAndFurious/MedHead/issues/40)). Mesurée à
+  400 réservations/s, elle permet au publieur de suivre la charge (arriéré maximal de 594
+  événements au lieu de 36 617), sans améliorer la latence de l'API* ;
 - tester la rétention du flux avec un consommateur actif ; protéger Redis d'un flux dont
   le consommateur est arrêté ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)).
   *Depuis le 25 novembre 2026, la rétention `ACKED` est conservée et un consommateur de
@@ -763,7 +764,14 @@ point de passage un par un sur tout disque lent.
   charge, mais une session attend toujours ce verrou et le p99 de l'API au pic reste à
   616 ms. Le publieur est désormais réveillé en mémoire après le commit, avec une
   scrutation de secours toutes les secondes
-  ([#41](https://github.com/TheFatAndFurious/MedHead/issues/41)) ; effet à mesurer* ;
+  ([#41](https://github.com/TheFatAndFurious/MedHead/issues/41)). Mesure : plus aucune
+  attente du verrou, p95 de l'API au pic de 18 ms et p99 de 213 ms, juste au-dessus du
+  seuil de 200 ms ; le reste vient de l'écriture du journal de chaque réservation sur le
+  disque partagé avec Redis
+  ([résultats](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-25-lots.md))* ;
+- regrouper les événements pendant quelques dizaines de millisecondes au réveil : le
+  publieur, réveillé à chaque réservation, publie des lots de 1,3 événement en moyenne et
+  multiplie les synchronisations disque ;
 - en production, séparer les volumes de PostgreSQL et de Redis, et choisir en
   connaissance de cause la synchronisation AOF de Redis (`everysec` peut perdre environ
   une seconde d'événements déjà marqués publiés) ;
@@ -771,7 +779,8 @@ point de passage un par un sur tout disque lent.
   que le publieur suit le débit. *Cause trouvée : après un lot incomplet, le publieur
   dormait pendant tout le délai de nouvelle tentative (1 s) dès que des événements
   restaient en attente, ce qui arrive sans cesse sous charge ; corrigé dans
-  [#40](https://github.com/TheFatAndFurious/MedHead/issues/40), à mesurer* ;
+  [#40](https://github.com/TheFatAndFurious/MedHead/issues/40) ; au pic, le retard p50 passe
+  de 498 à 30 ms, puis à 4 ms avec le réveil en mémoire* ;
 - borner l'attente de l'écoute `LISTEN`
   ([#7](https://github.com/TheFatAndFurious/MedHead/issues/7)) et isoler un événement
   impossible à publier ([#8](https://github.com/TheFatAndFurious/MedHead/issues/8)) ;
@@ -934,6 +943,7 @@ tests.
 | --- | --- |
 | Rapport du 22 novembre 2026 | [docs/performance/resultats-2026-11-22.md](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-22.md) |
 | Rapport du 25 novembre 2026 (outbox, synchronisation disque) | [docs/performance/resultats-2026-11-25.md](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-25.md) |
+| Rapport du 25 novembre 2026 (lots et réveil en mémoire) | [docs/performance/resultats-2026-11-25-lots.md](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-25-lots.md) |
 | `summary.json` et `verdict.json` de chaque exécution | [docs/performance/resultats-2026-11-22/](https://github.com/TheFatAndFurious/MedHead/tree/master/docs/performance/resultats-2026-11-22) |
 | Stratégie de tests de charge | [docs/performance/strategie-tests-charge.md](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/strategie-tests-charge.md) |
 | Guide d'exécution et scénarios k6 | [tests/performance/](https://github.com/TheFatAndFurious/MedHead/tree/master/tests/performance) |

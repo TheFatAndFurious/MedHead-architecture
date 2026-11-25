@@ -86,7 +86,8 @@ la réservation), `occurredAt` et `payload` (JSON : réservation, hôpital, spé
   - les événements publiés restent dans la table : une purge sera nécessaire ;
   - le `NOTIFY` fait passer un par un les commits des réservations, ce qui rend la
     latence de l'API sensible à la vitesse du disque (voir [Évolutions](#évolutions)) ;
-    traité par [#41](https://github.com/TheFatAndFurious/MedHead/issues/41), à mesurer.
+    traité par [#41](https://github.com/TheFatAndFurious/MedHead/issues/41) : l'attente de ce
+    verrou a disparu, le p99 de l'API au pic reste à 213 ms (seuil de 200 ms).
 
 ## Évolutions
 
@@ -153,8 +154,11 @@ Le même travail corrige le **retard d'environ une seconde** observé au pic. Qu
 le délai de nouvelle tentative (1 s), pour le cas où un autre publieur les verrouillerait.
 Sous charge, c'était le cas le plus courant, car des réservations étaient validées
 pendant le lot. Il attend désormais leur notification, déjà arrivée, et n'utilise ce
-délai que comme borne. L'effet des deux changements reste à mesurer par une campagne en
-configuration par défaut.
+délai que comme borne. Mesure à 400 réservations/s
+([résultats](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-25-lots.md)) : le publieur suit la charge
+(arriéré maximal de 594 événements au lieu de 36 617, retard p50 de 30 ms) et le retard
+d'environ une seconde disparaît, mais la latence de l'API ne s'améliore presque pas
+(voir l'évolution suivante).
 
 ### 25 novembre 2026 : réveil en mémoire, sans `NOTIFY`
 
@@ -188,4 +192,11 @@ Conséquences :
   sont dans le même service. Avec un publieur séparé, il faudrait un autre signal, ou
   revenir à `NOTIFY` émis hors de la transaction métier.
 
-L'effet sur la latence de l'API reste à mesurer.
+**Mesure** à 400 réservations/s, en configuration par défaut
+([résultats](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-25-lots.md)) : plus aucune session n'attend
+le verrou (0,95 avant), le p95 de l'API au pic passe de 334 à 18 ms et le p99 de 616 à
+213 ms ; les phases nominale et de récupération ont un p99 de 8 ms. Le seuil de 200 ms au
+p99 n'est pas encore tenu : chaque réservation attend l'écriture de son propre journal,
+lente par moments sur le disque partagé avec Redis. Effet de bord : réveillé à chaque
+réservation, le publieur fait des lots de 1,3 événement en moyenne ; les regrouper
+pendant quelques dizaines de millisecondes réduirait ses écritures disque.
