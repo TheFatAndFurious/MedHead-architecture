@@ -25,6 +25,7 @@ flowchart TB
         redis[("<b>Redis 8.2</b><br/><i>Base 0 : flux medhead:reservations,<br/>groupe reservation-consumers<br/>Base 1 : sessions et connexions OIDC</i>")]
         keycloak["<b>Keycloak 26</b><br/><i>Realm medhead, client medhead-web,<br/>rôles LECTEUR et REGULATEUR</i>"]
         kcdb[("<b>Base d'identité</b><br/>PostgreSQL 17")]
+        demo["<b>Consommateur de démonstration</b><br/>Python 3.13, redis-py<br/><i>Lit le groupe reservation-consumers,<br/>journalise et acquitte chaque événement</i>"]
     end
 
     consommateurs["<b>Consommateurs d'événements</b><br/><i>Hôpital receveur, tableau de bord,<br/>notifications</i><br/>Non construits dans la PoC"]
@@ -40,6 +41,7 @@ flowchart TB
     db -. "NOTIFY medhead_outbox" .-> api
     api -- "XADD BedReserved<br/>TLS, base 0" --> redis
     keycloak -- "JDBC" --> kcdb
+    demo -- "XREADGROUP, XACK<br/>TLS, base 0" --> redis
     redis -. "Événements lus par<br/>XREADGROUP, XACK" .-> consommateurs
 
     classDef personne fill:#08427b,stroke:#052e56,color:#ffffff
@@ -48,7 +50,7 @@ flowchart TB
     classDef externe fill:#999999,stroke:#6b6b6b,color:#ffffff
     classDef futur fill:#ffffff,stroke:#6b6b6b,color:#333333,stroke-dasharray:5 5
     class operateur personne
-    class front,api,keycloak conteneur
+    class front,api,keycloak,demo conteneur
     class db,redis,kcdb stockage
     class navigateur externe
     class consommateurs futur
@@ -64,6 +66,7 @@ flowchart TB
 | Redis | Redis 8.2, TLS, AOF | Base 0 : flux `medhead:reservations`, borné à environ 10 000 entrées, avec le groupe `reservation-consumers`. Base 1 : sessions du front et transactions de connexion OIDC, clés hachées en SHA-256. |
 | Keycloak | Keycloak 26.8 | Fournisseur d'identité : comptes de démonstration, rôles `LECTEUR` et `REGULATEUR` placés dans la revendication `roles`, audience `medhead-api` ajoutée au jeton d'accès. |
 | Base d'identité | PostgreSQL 17 | Stockage propre à Keycloak, séparé de la base de réservation. |
+| Consommateur de démonstration | Python 3.13, redis-py | Tient le rôle d'un consommateur métier minimal : lit le groupe `reservation-consumers` en TLS, journalise chaque événement puis l'acquitte, ce qui permet à la rétention `ACKED` de borner le flux. Recrée son groupe si le flux est supprimé ([`consumer.py`](https://github.com/TheFatAndFurious/MedHead/blob/master/docker/event-consumer/consumer.py)). |
 | Consommateurs | (à construire) | Liraient le flux avec un groupe de consommateurs et dédoublonneraient par `eventId` (livraison au moins une fois). |
 
 ## Points d'attention

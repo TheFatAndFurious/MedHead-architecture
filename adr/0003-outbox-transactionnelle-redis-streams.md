@@ -32,7 +32,9 @@ L'API applique le motif de l'**outbox transactionnelle** :
    `published_at` renseigné et `COMMIT`.
 5. Le flux est borné (`MAXLEN ~ 10000`, en ne supprimant que les entrées acquittées) et
    le groupe de consommateurs `reservation-consumers` est créé dès la première publication,
-   à partir du début du flux.
+   à partir du début du flux. Le publieur ne recrée pas les groupes à chaque événement :
+   ses `XADD` utilisent `NOMKSTREAM`, et seule la disparition du flux provoque la
+   recréation du flux et de ses groupes (voir [Évolutions](#évolutions)).
 
 Le contrat de l'événement est le suivant : `eventId`, `type`, `aggregateId` (identifiant de
 la réservation), `occurredAt` et `payload` (JSON : réservation, hôpital, spécialité, date).
@@ -66,12 +68,41 @@ la réservation), `occurredAt` et `payload` (JSON : réservation, hôpital, spé
 - **Plusieurs instances** : `SKIP LOCKED` permet à plusieurs publieurs de se partager
   l'outbox sans publier deux fois le même événement en temps normal.
 - **Points ouverts**, suivis dans le dépôt de code :
-  - débit : une transaction et un `XGROUP CREATE` par événement
+  - débit : une transaction par événement
     ([#6](https://github.com/TheFatAndFurious/MedHead/issues/6)) ;
   - écoute `LISTEN` sans délai maximal
     ([#7](https://github.com/TheFatAndFurious/MedHead/issues/7)) ;
   - un événement impossible à publier bloque les suivants
     ([#8](https://github.com/TheFatAndFurious/MedHead/issues/8)) ;
-  - un flux sans consommateur peut remplir Redis
+  - un flux dont un groupe n'est plus lu (consommateur arrêté) peut remplir Redis
     ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)) ;
   - les événements publiés restent dans la table : une purge sera nécessaire.
+
+## Évolutions
+
+### 25 novembre 2026 : groupes créés une fois, consommateur de démonstration
+
+Les campagnes de charge du 22 novembre 2026 ont montré que le publieur plafonne entre 140
+et 240 événements par seconde, et que le flux atteignait 172 802 entrées malgré
+`MAXLEN ~ 10000` ([rapport, 5.2](../reporting/rapport-poc.md#52-loutbox-sous-charge)).
+Deux corrections, sans changer la décision :
+
+- **Groupes créés une seule fois.** Le publieur envoyait un `XGROUP CREATE` par groupe et
+  par événement, refusé en `BUSYGROUP` sauf la première fois : un aller-retour Redis
+  inutile à chaque publication. Les groupes sont désormais créés avant le premier envoi.
+  Les `XADD` portent `NOMKSTREAM` : si le flux a été supprimé, Redis refuse l'ajout au
+  lieu de recréer un flux sans groupe, ce qui rendrait la rétention `ACKED` inopérante.
+  Le publieur recrée alors le flux et ses groupes, puis renvoie l'événement. Limite :
+  la suppression explicite d'un groupe (`XGROUP DESTROY`) sur un flux existant n'est
+  détectée qu'au redémarrage de l'API.
+- **Rétention `ACKED` conservée, avec un consommateur de démonstration.** Plutôt que de
+  supprimer des entrées non acquittées (politique `KEEPREF`), la PoC garde la protection
+  `ACKED` et ajoute le service `event-consumer`
+  ([`consumer.py`](https://github.com/TheFatAndFurious/MedHead/blob/master/docker/event-consumer/consumer.py)) : un script Python
+  qui lit le groupe `reservation-consumers` (`XREADGROUP`), journalise chaque événement
+  puis l'acquitte (`XACK`). Il représente un consommateur métier minimal, démarre avec la
+  PoC et participe aux campagnes de charge, ce qui permet de vérifier que le flux reste
+  borné quand les événements sont acquittés. Le risque d'un consommateur arrêté reste
+  ouvert ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)).
+
+L'effet sur le débit du publieur reste à mesurer par une nouvelle campagne de charge.
