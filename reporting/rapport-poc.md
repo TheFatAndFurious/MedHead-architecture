@@ -747,7 +747,10 @@ point de passage un par un sur tout disque lent.
 - envoyer les `XADD` en pipeline ou par lots, avec une transaction par lot plutôt que par
   événement ([#6](https://github.com/TheFatAndFurious/MedHead/issues/6)). *Depuis le
   25 novembre 2026, le groupe de consommateurs n'est plus créé qu'une fois, et non à
-  chaque événement ([ADR 0003, Évolutions](../adr/0003-outbox-transactionnelle-redis-streams.md#évolutions))* ;
+  chaque événement ([ADR 0003, Évolutions](../adr/0003-outbox-transactionnelle-redis-streams.md#évolutions)).
+  La publication par lots, une transaction et un pipeline `XADD` par lot, est en cours
+  ([#40](https://github.com/TheFatAndFurious/MedHead/issues/40)) ; son effet sur les
+  écritures disque et la latence de l'API reste à mesurer* ;
 - tester la rétention du flux avec un consommateur actif ; protéger Redis d'un flux dont
   le consommateur est arrêté ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)).
   *Depuis le 25 novembre 2026, la rétention `ACKED` est conservée et un consommateur de
@@ -760,8 +763,11 @@ point de passage un par un sur tout disque lent.
 - en production, séparer les volumes de PostgreSQL et de Redis, et choisir en
   connaissance de cause la synchronisation AOF de Redis (`everysec` peut perdre environ
   une seconde d'événements déjà marqués publiés) ;
-- expliquer le retard de publication d'environ une seconde qui subsiste au pic, alors
-  que le publieur suit le débit ;
+- supprimer le retard de publication d'environ une seconde qui subsiste au pic, alors
+  que le publieur suit le débit. *Cause trouvée : après un lot incomplet, le publieur
+  dormait pendant tout le délai de nouvelle tentative (1 s) dès que des événements
+  restaient en attente, ce qui arrive sans cesse sous charge ; corrigé dans
+  [#40](https://github.com/TheFatAndFurious/MedHead/issues/40), à mesurer* ;
 - borner l'attente de l'écoute `LISTEN`
   ([#7](https://github.com/TheFatAndFurious/MedHead/issues/7)) et isoler un événement
   impossible à publier ([#8](https://github.com/TheFatAndFurious/MedHead/issues/8)) ;
