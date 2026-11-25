@@ -59,7 +59,8 @@ la réservation), `occurredAt` et `payload` (JSON : réservation, hôpital, spé
 ## Conséquences
 
 - **Livraison au moins une fois** : si Redis accepte l'entrée mais que le `COMMIT` qui
-  marque l'événement publié échoue, l'événement est renvoyé. Les **consommateurs doivent
+  marque l'événement publié échoue, l'événement est renvoyé. Depuis la publication par
+  lots (voir [Évolutions](#évolutions)), c'est tout le lot qui est renvoyé. Les **consommateurs doivent
   être idempotents** et dédoublonner par `eventId`.
 - **Changer de courtier sans toucher au domaine** : seule la classe
   `RedisStreamPublisher` dépend de Redis. Passer à Kafka ou à RabbitMQ revient à écrire un
@@ -69,7 +70,9 @@ la réservation), `occurredAt` et `payload` (JSON : réservation, hôpital, spé
   l'outbox sans publier deux fois le même événement en temps normal.
 - **Points ouverts**, suivis dans le dépôt de code :
   - débit : une transaction par événement
-    ([#6](https://github.com/TheFatAndFurious/MedHead/issues/6)) ;
+    ([#6](https://github.com/TheFatAndFurious/MedHead/issues/6)) ; publication par lots
+    en cours ([#40](https://github.com/TheFatAndFurious/MedHead/issues/40)), effet à
+    mesurer ;
   - écoute `LISTEN` sans délai maximal
     ([#7](https://github.com/TheFatAndFurious/MedHead/issues/7)) ;
   - un événement impossible à publier bloque les suivants
@@ -119,3 +122,31 @@ d'attente se reporte sur l'API : p99 du pic à 854 ms au lieu de 15 ms le 22 nov
 Sans ces synchronisations, le publieur suit les 400 événements/s et l'API retrouve un p99
 de 16 ms ; les réglages utilisés pour le montrer acceptent une perte de données en cas
 de panne et ne sont pas adoptés. Ce verrou devient un point ouvert.
+
+### 25 novembre 2026 : publication par lots
+
+Pour réduire les écritures disque à l'origine de ce ralentissement
+([#40](https://github.com/TheFatAndFurious/MedHead/issues/40)), le publieur traite
+désormais un lot de 100 événements au plus dans **une seule transaction** :
+une sélection `FOR UPDATE SKIP LOCKED`, un **pipeline** de `XADD` dans l'ordre de
+l'outbox, une seule requête `UPDATE` pour marquer le lot publié, puis un commit. Un lot
+coûte un aller-retour Redis et une écriture du journal PostgreSQL au lieu d'un par
+événement ; avec `appendfsync always`, Redis ne synchronise en principe son fichier AOF
+qu'une fois pour les commandes reçues ensemble. La décision ne change pas :
+
+- **Doublons plus nombreux après une panne** : si Redis accepte une partie du lot puis
+  qu'une erreur survient, ou si le commit échoue, aucun événement du lot n'est marqué
+  publié et tout le lot est renvoyé avec les mêmes `eventId`. Le dédoublonnage par les
+  consommateurs, déjà exigé, couvre ce cas. La taille du lot
+  (`MEDHEAD_OUTBOX_BATCH_SIZE`) arbitre entre coût par événement et nombre de doublons
+  possibles.
+- **Verrous des lignes gardés pendant tout le lot** : un second publieur prend les lignes
+  suivantes grâce à `SKIP LOCKED`, sans attendre.
+
+Le même travail corrige le **retard d'environ une seconde** observé au pic. Quand des
+événements restaient en attente après un lot incomplet, le publieur dormait pendant tout
+le délai de nouvelle tentative (1 s), pour le cas où un autre publieur les verrouillerait.
+Sous charge, c'était le cas le plus courant, car des réservations étaient validées
+pendant le lot. Il attend désormais leur notification, déjà arrivée, et n'utilise ce
+délai que comme borne. L'effet des deux changements reste à mesurer par une campagne en
+configuration par défaut.
