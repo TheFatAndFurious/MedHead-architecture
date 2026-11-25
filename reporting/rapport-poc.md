@@ -100,7 +100,7 @@ simplifications ainsi :
 | Interface graphique | Front SvelteKit : connexion, carte des hôpitaux, formulaire lieu et spécialité, affichage de l'hôpital retenu | La localisation se choisit parmi huit lieux de démonstration du Grand Londres, pas par saisie libre ([README du front](https://github.com/TheFatAndFurious/MedHead/blob/master/frontend/README.md#carte-des-hôpitaux-et-lieux-durgence)) |
 | Référentiel des spécialités | Les 80 spécialités du référentiel NHS, chargées par une migration Flyway ([README](https://github.com/TheFatAndFurious/MedHead/blob/master/README.md#démarrage-avec-docker)) | — |
 | Référentiel hospitalier | Tables `hospital` et `hospital_specialty`, compteur de lits mis à jour à chaque réservation | Données fictives : 12 hôpitaux de démonstration dans le Grand Londres ([`seed-demo.sql`](https://github.com/TheFatAndFurious/MedHead/blob/master/docker/seed/seed-demo.sql)) ; aucune alimentation par les systèmes hospitaliers réels |
-| Événements | Publication de `BedReserved` dans Redis Streams, avec un groupe de consommateurs créé | Aucun consommateur métier (hôpital receveur, tableau de bord) n'est construit |
+| Événements | Publication de `BedReserved` dans Redis Streams, avec un groupe de consommateurs créé et un consommateur de démonstration qui journalise et acquitte les événements | Aucun consommateur métier (hôpital receveur, tableau de bord) n'est construit |
 | Identité | Keycloak, OpenID Connect, rôles `LECTEUR` et `REGULATEUR` | Comptes de démonstration ; le fournisseur d'identité du consortium n'est pas intégré |
 | Distance | Distance à vol d'oiseau sur l'ellipsoïde WGS 84 | Pas de temps de trajet réel ([ADR 0005](../adr/0005-postgis-recherche-proximite.md)) |
 | Données patient | Aucune : la demande ne contient qu'un lieu et une spécialité | Pas de dossier patient, pas de tri selon les symptômes (hors projet selon le Document de définition de l'architecture, p. 16) |
@@ -717,10 +717,14 @@ retard une fois la charge retombée.
 **Pistes d'amélioration**, par ordre d'effet attendu :
 
 - envoyer les `XADD` en pipeline ou par lots, avec une transaction par lot plutôt que par
-  événement, et ne créer le groupe de consommateurs qu'une fois
-  ([#6](https://github.com/TheFatAndFurious/MedHead/issues/6)) ;
-- revoir la rétention du flux et la tester avec un consommateur actif ; protéger Redis
-  d'un flux sans consommateur ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)) ;
+  événement ([#6](https://github.com/TheFatAndFurious/MedHead/issues/6)). *Depuis le
+  25 novembre 2026, le groupe de consommateurs n'est plus créé qu'une fois, et non à
+  chaque événement ([ADR 0003, Évolutions](../adr/0003-outbox-transactionnelle-redis-streams.md#évolutions))* ;
+- tester la rétention du flux avec un consommateur actif ; protéger Redis d'un flux dont
+  le consommateur est arrêté ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)).
+  *Depuis le 25 novembre 2026, la rétention `ACKED` est conservée et un consommateur de
+  démonstration acquitte les événements, y compris pendant les campagnes de charge ; une
+  nouvelle campagne doit confirmer que le flux reste borné et mesurer le débit* ;
 - borner l'attente de l'écoute `LISTEN`
   ([#7](https://github.com/TheFatAndFurious/MedHead/issues/7)) et isoler un événement
   impossible à publier ([#8](https://github.com/TheFatAndFurious/MedHead/issues/8)) ;

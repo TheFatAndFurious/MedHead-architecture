@@ -32,6 +32,7 @@ flowchart TB
             database[("<b>database</b><br/>medhead-postgis:17<br/>TLS obligatoire<br/>127.0.0.1:5432")]
             redis[("<b>redis</b><br/>medhead-redis:8.2.10<br/>TLS, mot de passe, AOF<br/>non publié")]
             identitydb[("<b>identity-database</b><br/>postgres:17-alpine<br/>non publié")]
+            consumer["<b>event-consumer</b><br/>medhead-event-consumer:local<br/>Python 3.13, utilisateur nobody<br/>non publié"]
             seed["<b>seed</b> (tâche unique)<br/>charge seed-demo.sql<br/>après l'API en bonne santé"]
         end
         subgraph init["Tâches d'initialisation, sans réseau"]
@@ -50,6 +51,7 @@ flowchart TB
     api -- "JDBC verify-full" --> database
     api -- "rediss:// base 0" --> redis
     api -- "JWKS" --> keycloak
+    consumer -- "rediss:// base 0<br/>XREADGROUP, XACK" --> redis
     keycloak --> identitydb
     seed -- "psql verify-full" --> database
     dbtls -. "certificats" .-> volumes
@@ -60,7 +62,7 @@ flowchart TB
     classDef appli fill:#438dd5,stroke:#2e6295,color:#ffffff
     classDef stockage fill:#2e6295,stroke:#1e4470,color:#ffffff
     classDef tache fill:#ffffff,stroke:#6b6b6b,color:#333333,stroke-dasharray:5 5
-    class frontend,api,keycloak appli
+    class frontend,api,keycloak,consumer appli
     class database,redis,identitydb,volumes stockage
     class seed,dbtls,redistls tache
 ```
@@ -75,6 +77,8 @@ flowchart TB
    expose `/actuator/health/readiness`.
 5. `seed` attend que l'API soit prête et charge le jeu de démonstration.
 6. `frontend` attend Keycloak et Redis.
+7. `event-consumer` attend que Redis soit prêt, crée le groupe `reservation-consumers`
+   s'il n'existe pas, puis lit et acquitte les événements.
 
 ### Variantes et profils
 
