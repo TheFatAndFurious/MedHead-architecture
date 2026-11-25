@@ -37,8 +37,7 @@ flowchart TB
     front -- "Lit et écrit les sessions<br/>TLS, base 1" --> redis
     front -- "REST JSON, Bearer JWT,<br/>Idempotency-Key<br/>HTTP sur le réseau Docker" --> api
     api -- "Récupère les clés JWKS" --> keycloak
-    api -- "JDBC, TLS verify-full<br/>pool + connexion LISTEN dédiée" --> db
-    db -. "NOTIFY medhead_outbox" .-> api
+    api -- "JDBC, TLS verify-full<br/>pool de connexions" --> db
     api -- "XADD BedReserved<br/>TLS, base 0" --> redis
     keycloak -- "JDBC" --> kcdb
     demo -- "XREADGROUP, XACK<br/>TLS, base 0" --> redis
@@ -75,9 +74,11 @@ flowchart TB
   l'API vérifie le certificat et le nom d'hôte (`sslmode=verify-full`). Le trafic HTTP
   entre le front et l'API, et vers Keycloak, reste en clair sur le réseau Docker interne :
   c'est un compromis assumé de la PoC.
-- **Connexion LISTEN dédiée** : le publieur de l'outbox ouvre une connexion PostgreSQL
-  hors du pool applicatif, bloquée en attente de `NOTIFY`. Elle ne consomme aucune
-  connexion du pool et n'interroge pas la base tant qu'aucun événement n'arrive.
+- **Publieur réveillé en mémoire** : le publieur de l'outbox tourne dans l'API. Il est
+  réveillé après chaque réservation validée par la même instance et lit l'outbox au plus
+  toutes les secondes sinon. Il n'utilise plus de connexion `LISTEN` ni de `NOTIFY`, qui
+  faisait passer les commits des réservations un par un
+  ([ADR 0003, Évolutions](../adr/0003-outbox-transactionnelle-redis-streams.md#évolutions)).
 - **Redis partagé** : le flux d'événements et les sessions du front partagent la même
   instance Redis, dans deux bases logiques, avec un seul compte
   ([#3](https://github.com/TheFatAndFurious/MedHead/issues/3)). Un déploiement de

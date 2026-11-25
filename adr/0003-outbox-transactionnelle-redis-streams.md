@@ -24,10 +24,13 @@ L'API applique le motif de l'**outbox transactionnelle** :
 1. Le service de réservation écrit l'événement `BedReserved` dans la table `event_outbox`,
    **dans la même transaction** que la réservation. Les deux existent, ou aucun.
 2. Un déclencheur sur `event_outbox` appelle `pg_notify('medhead_outbox')`. PostgreSQL ne
-   délivre la notification qu'au `COMMIT`.
+   délivre la notification qu'au `COMMIT`. *Remplacé le 25 novembre 2026 par un réveil en
+   mémoire (voir [Évolutions](#évolutions)).*
 3. Un publieur, dans l'API, écoute ce canal (`LISTEN`) sur une connexion dédiée, hors du
    pool. Au démarrage et à chaque notification, il publie les événements en attente.
-4. Chaque événement est publié dans sa propre transaction : sélection avec
+   *Remplacé de même.*
+4. Chaque événement est publié dans sa propre transaction (*par lot depuis le 25 novembre
+   2026*) : sélection avec
    `FOR UPDATE SKIP LOCKED`, `XADD` dans le flux Redis `medhead:reservations`, puis
    `published_at` renseigné et `COMMIT`.
 5. Le flux est borné (`MAXLEN ~ 10000`, en ne supprimant que les entrées acquittées) et
@@ -74,14 +77,17 @@ la réservation), `occurredAt` et `payload` (JSON : réservation, hôpital, spé
     en cours ([#40](https://github.com/TheFatAndFurious/MedHead/issues/40)), effet à
     mesurer ;
   - écoute `LISTEN` sans délai maximal
-    ([#7](https://github.com/TheFatAndFurious/MedHead/issues/7)) ;
+    ([#7](https://github.com/TheFatAndFurious/MedHead/issues/7)) ; sans objet depuis le
+    réveil en mémoire, dont l'attente est bornée par la scrutation de secours ;
   - un événement impossible à publier bloque les suivants
     ([#8](https://github.com/TheFatAndFurious/MedHead/issues/8)) ;
   - un flux dont un groupe n'est plus lu (consommateur arrêté) peut remplir Redis
     ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)) ;
   - les événements publiés restent dans la table : une purge sera nécessaire ;
   - le `NOTIFY` fait passer un par un les commits des réservations, ce qui rend la
-    latence de l'API sensible à la vitesse du disque (voir [Évolutions](#évolutions)).
+    latence de l'API sensible à la vitesse du disque (voir [Évolutions](#évolutions)) ;
+    traité par [#41](https://github.com/TheFatAndFurious/MedHead/issues/41) : l'attente de ce
+    verrou a disparu, le p99 de l'API au pic reste à 213 ms (seuil de 200 ms).
 
 ## Évolutions
 
@@ -148,5 +154,49 @@ Le même travail corrige le **retard d'environ une seconde** observé au pic. Qu
 le délai de nouvelle tentative (1 s), pour le cas où un autre publieur les verrouillerait.
 Sous charge, c'était le cas le plus courant, car des réservations étaient validées
 pendant le lot. Il attend désormais leur notification, déjà arrivée, et n'utilise ce
-délai que comme borne. L'effet des deux changements reste à mesurer par une campagne en
-configuration par défaut.
+délai que comme borne. Mesure à 400 réservations/s
+([résultats](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-25-lots.md)) : le publieur suit la charge
+(arriéré maximal de 594 événements au lieu de 36 617, retard p50 de 30 ms) et le retard
+d'environ une seconde disparaît, mais la latence de l'API ne s'améliore presque pas
+(voir l'évolution suivante).
+
+### 25 novembre 2026 : réveil en mémoire, sans `NOTIFY`
+
+La campagne sur la publication par lots, à 400 réservations/s, montre que le publieur suit
+désormais la charge (arriéré maximal de 594 événements, retard p50 de 30 ms), mais que la
+latence de l'API au pic dépasse toujours le seuil (p95 334 ms, p99 616 ms) : en moyenne
+une session attend encore le verrou du `NOTIFY`. Les lots ne réduisent pas assez les
+synchronisations disque de Redis pour libérer ce verrou.
+
+**Décision révisée** ([#41](https://github.com/TheFatAndFurious/MedHead/issues/41)) : la
+transaction de réservation n'émet plus de `NOTIFY`. La migration V7 supprime le
+déclencheur. L'API et le publieur tournant dans le même processus, l'écriture dans
+l'outbox (`OutboxWriter`) réveille le publieur en mémoire **après** le `COMMIT`, jamais
+après un rollback. Un réveil reçu pendant un lot n'est pas perdu. Le publieur lit en plus
+l'outbox au plus toutes les secondes (`MEDHEAD_OUTBOX_POLL_INTERVAL`) quand rien ne le
+réveille.
+
+Conséquences :
+
+- **Les commits des réservations ne passent plus un par un**, quelle que soit la vitesse
+  du disque.
+- **Retour d'une scrutation, limitée au secours** : elle publie les événements qu'aucun
+  réveil local n'annonce (instance arrêtée avant de publier, instance sans publieur,
+  lignes libérées par un publieur qui annule), avec au plus une seconde de retard. Elle
+  coûte une requête par seconde et par instance quand l'outbox est vide, ce que la
+  première version cherchait à éviter avec un intervalle court ; ici, l'intervalle ne fixe
+  pas la latence normale.
+- **Plus de connexion `LISTEN` dédiée** : un point de défaillance et de reconnexion en
+  moins.
+- **Couplage au processus** : ce réveil ne fonctionne que si l'écriture et la publication
+  sont dans le même service. Avec un publieur séparé, il faudrait un autre signal, ou
+  revenir à `NOTIFY` émis hors de la transaction métier.
+
+**Mesure** à 400 réservations/s, en configuration par défaut
+([résultats](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-25-lots.md)) : plus aucune session n'attend
+le verrou (0,95 avant), le p95 de l'API au pic passe de 334 à 18 ms et le p99 de 616 à
+213 ms ; les phases nominale et de récupération ont un p99 de 8 ms. Le seuil de 200 ms au
+p99 n'est pas encore tenu : chaque réservation attend l'écriture de son propre journal,
+lente par moments sur le disque partagé avec Redis. Effet de bord : réveillé à chaque
+réservation, le publieur fait des lots de 1,3 événement en moyenne ; les regrouper
+pendant quelques dizaines de millisecondes réduirait ses écritures disque.
