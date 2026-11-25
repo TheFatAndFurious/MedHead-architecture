@@ -76,7 +76,9 @@ la réservation), `occurredAt` et `payload` (JSON : réservation, hôpital, spé
     ([#8](https://github.com/TheFatAndFurious/MedHead/issues/8)) ;
   - un flux dont un groupe n'est plus lu (consommateur arrêté) peut remplir Redis
     ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)) ;
-  - les événements publiés restent dans la table : une purge sera nécessaire.
+  - les événements publiés restent dans la table : une purge sera nécessaire ;
+  - le `NOTIFY` fait passer un par un les commits des réservations, ce qui rend la
+    latence de l'API sensible à la vitesse du disque (voir [Évolutions](#évolutions)).
 
 ## Évolutions
 
@@ -105,4 +107,15 @@ Deux corrections, sans changer la décision :
   borné quand les événements sont acquittés. Le risque d'un consommateur arrêté reste
   ouvert ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)).
 
-L'effet sur le débit du publieur reste à mesurer par une nouvelle campagne de charge.
+**Mesure.** Les campagnes du 25 novembre 2026, à 400 réservations/s
+([résultats](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-25.md)),
+montrent que le flux reste borné à 10 000 entrées et que le publieur passe de 206 à
+près de 300 événements/s au pic (277 et 308 dans les deux campagnes). Elles ont aussi révélé une conséquence de la décision : le
+`NOTIFY` émis dans la transaction de réservation fait prendre à PostgreSQL, au `COMMIT`,
+un verrou exclusif global gardé jusqu'à la fin de l'écriture du journal sur disque. Ces
+commits passent donc un par un. Quand le disque ralentit, ici à cause des
+synchronisations AOF de Redis (`appendfsync always`) sur le même disque virtuel, la file
+d'attente se reporte sur l'API : p99 du pic à 854 ms au lieu de 15 ms le 22 novembre.
+Sans ces synchronisations, le publieur suit les 400 événements/s et l'API retrouve un p99
+de 16 ms ; les réglages utilisés pour le montrer acceptent une perte de données en cas
+de panne et ne sont pas adoptés. Ce verrou devient un point ouvert.
