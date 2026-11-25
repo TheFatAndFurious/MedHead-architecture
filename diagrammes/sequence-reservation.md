@@ -4,14 +4,16 @@ Ce diagramme suit une demande de réservation, du formulaire du régulateur jusq
 l'événement `BedReserved` dans Redis Streams.
 
 > Établi à partir du commit
-> [`b31cfc3`](https://github.com/TheFatAndFurious/MedHead/tree/b31cfc3) de `master`.
+> [`b31cfc3`](https://github.com/TheFatAndFurious/MedHead/tree/b31cfc3) de `master`, puis mis à jour
+> pour la publication par lots ([#40](https://github.com/TheFatAndFurious/MedHead/issues/40)) et le
+> réveil en mémoire du publieur ([#41](https://github.com/TheFatAndFurious/MedHead/issues/41)).
 > Sources : [`+page.server.ts`](https://github.com/TheFatAndFurious/MedHead/blob/master/frontend/src/routes/%2Bpage.server.ts),
 > [`hooks.server.ts`](https://github.com/TheFatAndFurious/MedHead/blob/master/frontend/src/hooks.server.ts),
 > [`HospitalReservationController.java`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/java/com/example/medhead/hospital/api/HospitalReservationController.java),
 > [`ReserveNearestAvailableBedService.java`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/java/com/example/medhead/hospital/application/ReserveNearestAvailableBedService.java),
 > [`HospitalRepository.java`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/java/com/example/medhead/hospital/persistence/HospitalRepository.java),
 > [`ReservationRequestRepository.java`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/java/com/example/medhead/hospital/persistence/ReservationRequestRepository.java),
-> [`V5__notify_outbox_insertions.sql`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/resources/db/migration/V5__notify_outbox_insertions.sql)
+> [`V7__drop_outbox_notify_trigger.sql`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/resources/db/migration/V7__drop_outbox_notify_trigger.sql)
 > et le paquet [`outbox`](https://github.com/TheFatAndFurious/MedHead/tree/master/src/main/java/com/example/medhead/outbox).
 
 ## Partie synchrone : réserver
@@ -56,9 +58,9 @@ sequenceDiagram
         end
         A->>P: INSERT bed_reservation
         A->>P: INSERT event_outbox (BedReserved, published_at NULL)
-        Note right of P: Le déclencheur appelle pg_notify('medhead_outbox').<br/>PostgreSQL ne délivre la notification qu'au COMMIT.
         A->>P: INSERT reservation_request (empreinte SHA-256, réponse JSON)
         A->>P: COMMIT
+        Note right of A: Après le COMMIT seulement : réveil en mémoire<br/>du publieur de la même instance (aucun NOTIFY).
         A-->>F: 201 Created (hôpital, distance, lits restants)
     end
 
@@ -78,8 +80,9 @@ sequenceDiagram
 
 ## Partie asynchrone : publier
 
-Le publieur tourne dans l'API, sur un fil dédié. Il est réveillé par la notification
-PostgreSQL ; il n'interroge pas la base à intervalle régulier.
+Le publieur tourne dans l'API, sur un fil dédié. Il est réveillé en mémoire après chaque
+réservation validée par la même instance ; sans réveil, il lit l'outbox au plus toutes les
+secondes, pour les événements d'une autre instance arrêtée avant de les publier.
 
 ```mermaid
 sequenceDiagram
@@ -89,21 +92,20 @@ sequenceDiagram
     participant X as Redis base 0<br/>(flux medhead:reservations)
     participant C as Consommateurs<br/>(non construits)
 
-    Note over L,P: Au démarrage : LISTEN medhead_outbox sur une connexion dédiée,<br/>puis rattrapage des événements en attente.
-    P--)L: NOTIFY medhead_outbox (après le COMMIT de la réservation)
+    Note over L,P: Au démarrage : rattrapage des événements en attente.<br/>Ensuite : réveil en mémoire après chaque réservation validée, ou au plus tard après 1 s.
 
-    loop Lot de 100 événements au plus, une transaction par événement
+    loop Tant que le lot est complet : une transaction par lot de 100 événements au plus
         L->>P: BEGIN
-        L->>P: SELECT event_outbox WHERE published_at IS NULL<br/>ORDER BY occurred_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
-        P-->>L: Événement le plus ancien non publié
-        L->>X: XGROUP CREATE reservation-consumers 0-0 MKSTREAM<br/>(ignoré si le groupe existe)
-        L->>X: XADD medhead:reservations MAXLEN ~ 10000<br/>(eventId, type, aggregateId, occurredAt, payload)
-        X-->>L: Identifiant de l'entrée
-        L->>P: UPDATE event_outbox SET published_at = now()
+        L->>P: SELECT event_outbox WHERE published_at IS NULL<br/>ORDER BY occurred_at, id LIMIT 100 FOR UPDATE SKIP LOCKED
+        P-->>L: Événements non publiés les plus anciens
+        Note over L,X: Groupes créés une seule fois (XGROUP CREATE … MKSTREAM),<br/>puis seulement si le flux a disparu.
+        L->>X: Pipeline : un XADD par événement, NOMKSTREAM MAXLEN ~ 10000 ACKED<br/>(eventId, type, aggregateId, occurredAt, payload)
+        X-->>L: Un identifiant par entrée
+        L->>P: UPDATE event_outbox SET published_at = now() WHERE id IN (lot)
         L->>P: COMMIT
     end
 
-    Note over L: Lot vide : attente bloquante de la prochaine notification.<br/>Erreur Redis ou base : nouvel essai après 1 s.
+    Note over L: Lot incomplet : attente du prochain réveil, 1 s au plus.<br/>Erreur Redis ou base : tout le lot est annulé, nouvel essai après 1 s.
 
     C->>X: XREADGROUP GROUP reservation-consumers
     X-->>C: BedReserved
@@ -119,8 +121,8 @@ sequenceDiagram
 - **Pas d'événement sans réservation, ni de réservation sans événement** : les deux
   écritures sont dans la même transaction (voir [ADR 0003](../adr/0003-outbox-transactionnelle-redis-streams.md)
   et [ADR 0006](../adr/0006-reserver-puis-publier.md)).
-- **Livraison au moins une fois** : si Redis accepte l'entrée mais que le `COMMIT` qui
-  marque l'événement publié échoue, l'événement sera renvoyé. Les consommateurs
+- **Livraison au moins une fois** : si Redis accepte tout ou partie du lot mais que le
+  `COMMIT` qui le marque publié échoue, tout le lot sera renvoyé. Les consommateurs
   dédoublonnent par `eventId`.
 - **Plusieurs instances de l'API** : `FOR UPDATE SKIP LOCKED` permet à plusieurs
   publieurs de se partager l'outbox sans publier deux fois le même événement en temps

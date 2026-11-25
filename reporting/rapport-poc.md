@@ -295,10 +295,9 @@ compte ne renvoie jamais la réservation d'un tiers
   OAuth restent dans la session Redis du front, sous une clé hachée
   ([guide d'authentification](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/authentification.md#session-web)).
 - **Journaux sans donnée sensible** : l'API ne journalise ni les demandes ni les
-  réponses. Ses seuls messages applicatifs concernent l'outbox (échec de publication,
-  reconnexion de l'écoute) et ne reprennent que le message de l'exception technique
-  ([`OutboxPublisher`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/java/com/example/medhead/outbox/OutboxPublisher.java),
-  [`OutboxNotificationListener`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/java/com/example/medhead/outbox/OutboxNotificationListener.java)).
+  réponses. Son seul message applicatif concerne l'échec de publication de l'outbox et
+  ne reprend que le message de l'exception technique
+  ([`OutboxPublisher`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/java/com/example/medhead/outbox/OutboxPublisher.java)).
   Le front n'écrit qu'un message générique quand le stockage des sessions est
   indisponible.
 
@@ -385,11 +384,14 @@ représenté dans le [diagramme de séquence](../diagrammes/sequence-reservation
    **dans la même transaction** que le décrément du lit et la réservation : les deux
    existent, ou aucun. Il n'y a donc ni réservation sans événement, ni événement d'une
    réservation annulée ([ADR 0003](../adr/0003-outbox-transactionnelle-redis-streams.md)).
-2. **Réveil par `LISTEN/NOTIFY`.** Un déclencheur PostgreSQL émet `pg_notify` au `COMMIT`.
-   Le publieur, dans l'API, écoute ce canal sur une connexion dédiée et publie
-   aussitôt, sans interroger la table à intervalle régulier
-   ([`V5__notify_outbox_insertions.sql`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/resources/db/migration/V5__notify_outbox_insertions.sql),
-   [`OutboxNotificationListener`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/java/com/example/medhead/outbox/OutboxNotificationListener.java)).
+2. **Réveil après le `COMMIT`.** Le publieur, dans l'API, est réveillé en mémoire après
+   chaque réservation validée et publie aussitôt ; sans réveil, il lit l'outbox au plus
+   toutes les secondes, en secours
+   ([`OutboxWriter`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/java/com/example/medhead/outbox/OutboxWriter.java),
+   [`OutboxDispatcher`](https://github.com/TheFatAndFurious/MedHead/blob/master/src/main/java/com/example/medhead/outbox/OutboxDispatcher.java)).
+   La première version utilisait `LISTEN/NOTIFY` ; le `NOTIFY` dans la transaction de
+   réservation faisait passer les commits un par un sous charge, il a été retiré
+   ([5.2](#52-loutbox-sous-charge)).
 3. **Redis Streams et groupes de consommateurs.** L'événement est ajouté au flux
    `medhead:reservations` par `XADD`. Le groupe `reservation-consumers` est créé dès la
    première publication : chaque futur système (hôpital receveur, tableau de bord,
@@ -756,10 +758,12 @@ point de passage un par un sur tout disque lent.
   *Depuis le 25 novembre 2026, la rétention `ACKED` est conservée et un consommateur de
   démonstration acquitte les événements, y compris pendant les campagnes de charge ; le
   flux reste borné à 10 000 entrées* ;
-- ne plus émettre de `NOTIFY` dans la transaction de réservation (réveil par sondage court
-  ou par un autre canal), pour que les commits ne passent plus un par un ; à défaut,
-  désactiver l'attente du disque au `COMMIT` pour les seules transactions du publieur, ce
-  qui ne peut que faire renvoyer un événement ;
+- ne plus émettre de `NOTIFY` dans la transaction de réservation, pour que les commits ne
+  passent plus un par un. *La campagne sur les lots l'a confirmé : le publieur suit la
+  charge, mais une session attend toujours ce verrou et le p99 de l'API au pic reste à
+  616 ms. Le publieur est désormais réveillé en mémoire après le commit, avec une
+  scrutation de secours toutes les secondes
+  ([#41](https://github.com/TheFatAndFurious/MedHead/issues/41)) ; effet à mesurer* ;
 - en production, séparer les volumes de PostgreSQL et de Redis, et choisir en
   connaissance de cause la synchronisation AOF de Redis (`everysec` peut perdre environ
   une seconde d'événements déjà marqués publiés) ;
@@ -807,7 +811,7 @@ encore d'issue sont signalés comme tels.
 | Étape | Objectif | Travaux |
 | --- | --- | --- |
 | **1. Avant tout déploiement hors poste local** | Sécurité minimale d'un environnement partagé | [#16](https://github.com/TheFatAndFurious/MedHead/issues/16) (HTTPS interne, Keycloak en production, secrets obligatoires) ; [#1](https://github.com/TheFatAndFurious/MedHead/issues/1) (rôle PostgreSQL) ; [#3](https://github.com/TheFatAndFurious/MedHead/issues/3) (comptes Redis) ; [#4](https://github.com/TheFatAndFurious/MedHead/issues/4) (CSP) ; [#5](https://github.com/TheFatAndFurious/MedHead/issues/5) (accès aux métriques) ; [#12](https://github.com/TheFatAndFurious/MedHead/issues/12) (actions CI par SHA) ; [#14](https://github.com/TheFatAndFurious/MedHead/issues/14) (fonds de carte) ; [#15](https://github.com/TheFatAndFurious/MedHead/issues/15) (image PostGIS) ; analyse automatique du code et des dépendances en CI (sans issue) |
-| **2. Fiabilité et débit des événements** | Retard de publication compatible avec le temps réel | [#6](https://github.com/TheFatAndFurious/MedHead/issues/6) (débit) ; [#2](https://github.com/TheFatAndFurious/MedHead/issues/2) (flux sans consommateur) ; [#7](https://github.com/TheFatAndFurious/MedHead/issues/7) (écoute sans délai) ; [#8](https://github.com/TheFatAndFurious/MedHead/issues/8) (événement bloquant) ; [#9](https://github.com/TheFatAndFurious/MedHead/issues/9) (événements orphelins) ; purge de l'outbox et premier consommateur réel (sans issue) ; réveil du publieur sans `NOTIFY` dans la transaction de réservation (sans issue) |
+| **2. Fiabilité et débit des événements** | Retard de publication compatible avec le temps réel | [#6](https://github.com/TheFatAndFurious/MedHead/issues/6) (débit) ; [#2](https://github.com/TheFatAndFurious/MedHead/issues/2) (flux sans consommateur) ; [#7](https://github.com/TheFatAndFurious/MedHead/issues/7) (écoute sans délai) ; [#8](https://github.com/TheFatAndFurious/MedHead/issues/8) (événement bloquant) ; [#9](https://github.com/TheFatAndFurious/MedHead/issues/9) (événements orphelins) ; purge de l'outbox et premier consommateur réel (sans issue) ; réveil du publieur sans `NOTIFY` dans la transaction de réservation ([#41](https://github.com/TheFatAndFurious/MedHead/issues/41)) |
 | **3. Performance et exploitation** | Tenir 800 req/s par instance dans l'environnement cible, et le prouver | Dimensionner PostgreSQL d'après la campagne à 4 CPU ; expliquer le blocage de sept secondes du scénario mixte ; répéter les campagnes avec un générateur sur une autre machine ; [#13](https://github.com/TheFatAndFurious/MedHead/issues/13) (liste des hôpitaux sans limite) ; plusieurs instances derrière un répartiteur, SLI et alertes, plan de reprise d'activité (sans issue) |
 | **4. Conformité et intégration à la plateforme** | Passer de la PoC à un service de production | AIPD, registre des traitements, chiffrement au repos, durées de conservation appliquées ([3.1](#31-rgpd)) ; spécification OpenAPI ; mesure de la couverture de code ; intégration au fournisseur d'identité OIDC de l'État et à la passerelle d'API ; saisie libre de la localisation et temps de trajet réel (tous sans issue) ; [#10](https://github.com/TheFatAndFurious/MedHead/issues/10) (message du front sur `404`) |
 
