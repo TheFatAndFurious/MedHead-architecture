@@ -714,6 +714,34 @@ publication n'a jamais ralenti les réservations ni la réponse au régulateur, 
 événement n'a été perdu ni dupliqué en base. La publication finit par rattraper son
 retard une fois la charge retombée.
 
+**Après les premières améliorations (25 novembre 2026).** Les groupes Redis ne sont plus
+créés qu'une fois et un consommateur de démonstration acquitte les événements. À
+400 réservations/s :
+
+1. Le flux reste borné à 10 000 entrées et Redis n'utilise plus que 5 % d'un CPU au pic,
+   contre 79 %. Le publieur passe de 206 à près de 300 événements/s (277 et 308 dans les
+   deux campagnes).
+2. Mais la latence de l'API se dégrade au pic : p99 de 791 et 854 ms, contre 15 ms le
+   22 novembre. Des relevés disque et des événements d'attente de PostgreSQL l'expliquent.
+   Redis, avec `appendfsync always`, synchronise son fichier AOF à chaque `XADD` ; plus
+   le publieur est rapide, plus il le fait, sur le même disque virtuel que PostgreSQL. La
+   synchronisation du journal PostgreSQL passe de 0,15 à 0,60 ms en moyenne. Or le
+   `NOTIFY` émis dans la transaction de réservation fait prendre à PostgreSQL, au
+   `COMMIT`, un verrou exclusif global gardé jusqu'à la fin de cette synchronisation : les
+   commits des réservations passent un par un, et en moyenne une session attend ce
+   verrou en permanence.
+3. Trois campagnes de diagnostic le confirment. Sans synchronisation Redis à chaque
+   écriture, ou sans attente du disque au `COMMIT` dans PostgreSQL, l'attente du verrou
+   disparaît presque. Avec les deux réglages, le publieur suit les 400 événements/s,
+   l'arriéré se résorbe en 2,5 s au lieu de 3 minutes, et l'API passe tous les seuils
+   (p95 5,3 ms, p99 16 ms). Ces réglages acceptent de perdre des données confirmées en
+   cas de panne et ne sont pas adoptés.
+
+Source : [résultats du 25 novembre 2026](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-25.md).
+Ces mesures reposent sur une exécution par campagne, sous Docker Desktop où tous les
+conteneurs partagent un seul fichier disque. Le verrou du `NOTIFY` reste en revanche un
+point de passage un par un sur tout disque lent.
+
 **Pistes d'amélioration**, par ordre d'effet attendu :
 
 - envoyer les `XADD` en pipeline ou par lots, avec une transaction par lot plutôt que par
@@ -723,8 +751,17 @@ retard une fois la charge retombée.
 - tester la rétention du flux avec un consommateur actif ; protéger Redis d'un flux dont
   le consommateur est arrêté ([#2](https://github.com/TheFatAndFurious/MedHead/issues/2)).
   *Depuis le 25 novembre 2026, la rétention `ACKED` est conservée et un consommateur de
-  démonstration acquitte les événements, y compris pendant les campagnes de charge ; une
-  nouvelle campagne doit confirmer que le flux reste borné et mesurer le débit* ;
+  démonstration acquitte les événements, y compris pendant les campagnes de charge ; le
+  flux reste borné à 10 000 entrées* ;
+- ne plus émettre de `NOTIFY` dans la transaction de réservation (réveil par sondage court
+  ou par un autre canal), pour que les commits ne passent plus un par un ; à défaut,
+  désactiver l'attente du disque au `COMMIT` pour les seules transactions du publieur, ce
+  qui ne peut que faire renvoyer un événement ;
+- en production, séparer les volumes de PostgreSQL et de Redis, et choisir en
+  connaissance de cause la synchronisation AOF de Redis (`everysec` peut perdre environ
+  une seconde d'événements déjà marqués publiés) ;
+- expliquer le retard de publication d'environ une seconde qui subsiste au pic, alors
+  que le publieur suit le débit ;
 - borner l'attente de l'écoute `LISTEN`
   ([#7](https://github.com/TheFatAndFurious/MedHead/issues/7)) et isoler un événement
   impossible à publier ([#8](https://github.com/TheFatAndFurious/MedHead/issues/8)) ;
@@ -764,7 +801,7 @@ encore d'issue sont signalés comme tels.
 | Étape | Objectif | Travaux |
 | --- | --- | --- |
 | **1. Avant tout déploiement hors poste local** | Sécurité minimale d'un environnement partagé | [#16](https://github.com/TheFatAndFurious/MedHead/issues/16) (HTTPS interne, Keycloak en production, secrets obligatoires) ; [#1](https://github.com/TheFatAndFurious/MedHead/issues/1) (rôle PostgreSQL) ; [#3](https://github.com/TheFatAndFurious/MedHead/issues/3) (comptes Redis) ; [#4](https://github.com/TheFatAndFurious/MedHead/issues/4) (CSP) ; [#5](https://github.com/TheFatAndFurious/MedHead/issues/5) (accès aux métriques) ; [#12](https://github.com/TheFatAndFurious/MedHead/issues/12) (actions CI par SHA) ; [#14](https://github.com/TheFatAndFurious/MedHead/issues/14) (fonds de carte) ; [#15](https://github.com/TheFatAndFurious/MedHead/issues/15) (image PostGIS) ; analyse automatique du code et des dépendances en CI (sans issue) |
-| **2. Fiabilité et débit des événements** | Retard de publication compatible avec le temps réel | [#6](https://github.com/TheFatAndFurious/MedHead/issues/6) (débit) ; [#2](https://github.com/TheFatAndFurious/MedHead/issues/2) (flux sans consommateur) ; [#7](https://github.com/TheFatAndFurious/MedHead/issues/7) (écoute sans délai) ; [#8](https://github.com/TheFatAndFurious/MedHead/issues/8) (événement bloquant) ; [#9](https://github.com/TheFatAndFurious/MedHead/issues/9) (événements orphelins) ; purge de l'outbox et premier consommateur réel (sans issue) |
+| **2. Fiabilité et débit des événements** | Retard de publication compatible avec le temps réel | [#6](https://github.com/TheFatAndFurious/MedHead/issues/6) (débit) ; [#2](https://github.com/TheFatAndFurious/MedHead/issues/2) (flux sans consommateur) ; [#7](https://github.com/TheFatAndFurious/MedHead/issues/7) (écoute sans délai) ; [#8](https://github.com/TheFatAndFurious/MedHead/issues/8) (événement bloquant) ; [#9](https://github.com/TheFatAndFurious/MedHead/issues/9) (événements orphelins) ; purge de l'outbox et premier consommateur réel (sans issue) ; réveil du publieur sans `NOTIFY` dans la transaction de réservation (sans issue) |
 | **3. Performance et exploitation** | Tenir 800 req/s par instance dans l'environnement cible, et le prouver | Dimensionner PostgreSQL d'après la campagne à 4 CPU ; expliquer le blocage de sept secondes du scénario mixte ; répéter les campagnes avec un générateur sur une autre machine ; [#13](https://github.com/TheFatAndFurious/MedHead/issues/13) (liste des hôpitaux sans limite) ; plusieurs instances derrière un répartiteur, SLI et alertes, plan de reprise d'activité (sans issue) |
 | **4. Conformité et intégration à la plateforme** | Passer de la PoC à un service de production | AIPD, registre des traitements, chiffrement au repos, durées de conservation appliquées ([3.1](#31-rgpd)) ; spécification OpenAPI ; mesure de la couverture de code ; intégration au fournisseur d'identité OIDC de l'État et à la passerelle d'API ; saisie libre de la localisation et temps de trajet réel (tous sans issue) ; [#10](https://github.com/TheFatAndFurious/MedHead/issues/10) (message du front sur `404`) |
 
@@ -886,6 +923,7 @@ tests.
 | Ressource | Lien |
 | --- | --- |
 | Rapport du 22 novembre 2026 | [docs/performance/resultats-2026-11-22.md](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-22.md) |
+| Rapport du 25 novembre 2026 (outbox, synchronisation disque) | [docs/performance/resultats-2026-11-25.md](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/resultats-2026-11-25.md) |
 | `summary.json` et `verdict.json` de chaque exécution | [docs/performance/resultats-2026-11-22/](https://github.com/TheFatAndFurious/MedHead/tree/master/docs/performance/resultats-2026-11-22) |
 | Stratégie de tests de charge | [docs/performance/strategie-tests-charge.md](https://github.com/TheFatAndFurious/MedHead/blob/master/docs/performance/strategie-tests-charge.md) |
 | Guide d'exécution et scénarios k6 | [tests/performance/](https://github.com/TheFatAndFurious/MedHead/tree/master/tests/performance) |
